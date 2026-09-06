@@ -308,6 +308,12 @@ pub struct OidcConfig {
     pub auto_create_missing_user: bool,
     #[serde(default = "default_oidc_display_label")]
     pub display_label: String,
+    /// Claim holding the users group memberships. Defaults to "groups".
+    #[serde(default = "default_oidc_groups_claim")]
+    pub groups_claim: String,
+    /// Group that grants the admin role. When unset, roles are left alone.
+    #[serde(default)]
+    pub admin_group: Option<String>,
 }
 
 fn default_oidc_scopes() -> Vec<String> {
@@ -322,6 +328,9 @@ fn default_oidc_username_claim() -> String {
     "preferred_username".to_string()
 }
 
+fn default_oidc_groups_claim() -> String {
+    "groups".to_string()
+}
 fn default_oidc_display_label() -> String {
     "OpenID Connect".to_string()
 }

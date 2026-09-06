@@ -927,3 +927,23 @@ mod tests {
         validate_oidc_startup_config(&config).expect("loopback HTTP issuer should be allowed");
     }
 }
+
+/// True when `groups_claim` in the ID token contains `admin_group`.
+///
+/// Accepts either an array of strings (the usual shape, and what pocket-id
+/// emits) or a single string, since providers differ. A missing or malformed
+/// claim means "not an admin" rather than an error: losing the claim should
+/// demote, never break the login.
+pub fn is_admin_from_claims(claims: &Value, groups_claim: &str, admin_group: &str) -> bool {
+    let Some(value) = claims.get(groups_claim) else {
+        return false;
+    };
+    match value {
+        Value::Array(groups) => groups
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|group| group == admin_group),
+        Value::String(group) => group == admin_group,
+        _ => false,
+    }
+}

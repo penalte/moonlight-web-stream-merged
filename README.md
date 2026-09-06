@@ -665,6 +665,8 @@ Options:
 - `username_claim`: defaults to `preferred_username`.
 - `auto_create_missing_user`: defaults to `false`. When enabled, a missing OIDC identity is created with the default normal user role, no local password, and a stored issuer+subject binding.
 - `display_label`: defaults to `OpenID Connect` and is shown on the login button.
+- `groups_claim`: claim holding group membership. Defaults to `groups`.
+- `admin_group`: group that grants the admin role. When unset, roles are never changed by OIDC. When set, the role is re-evaluated on every login, so granting or revoking the group in the provider takes effect on the next sign-in.
 
 Local password login is still available for administrators as a break-glass path. OIDC logins do not attach to existing local users by username, including admin users. SAML is not implemented by this native OIDC integration.
 

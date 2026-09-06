@@ -32,7 +32,8 @@ use crate::app::{
     role::{Role, RoleId},
     storage::{
         Either, Storage, StorageHostModify, StorageOidcIdentity, StorageRoleAdd,
-        StorageRoleDefaultSettings, StorageRolePermissions, StorageUserAdd, create_storage,
+        StorageRoleDefaultSettings, StorageRolePermissions, StorageUserAdd, StorageUserModify,
+        create_storage,
     },
     stream::{Stream, StreamId},
     user::{Admin, AuthenticatedUser, RoleType, User, UserId},
@@ -648,6 +649,48 @@ impl App {
     }
 
     /// Returns any role that is an Admin
+    /// Aligns an OIDC user role with their group membership.
+    ///
+    /// Runs on every login, so granting or revoking the admin group in the
+    /// identity provider takes effect on the users next sign in. Roles are
+    /// only touched when admin_group is configured.
+    pub async fn sync_oidc_admin_role(
+        &self,
+        user: &mut AuthenticatedUser,
+        is_admin: bool,
+    ) -> Result<(), AppError> {
+        let mut current = user.role().await?;
+        if matches!(current.ty().await?, RoleType::Admin) == is_admin {
+            return Ok(());
+        }
+
+        let target = if is_admin {
+            self.admin_role().await?
+        } else {
+            self.default_role().await?
+        };
+        if target.id() == current.id() {
+            return Ok(());
+        }
+
+        self.inner
+            .storage
+            .modify_user(
+                user.id(),
+                StorageUserModify {
+                    role_id: Some(target.id()),
+                    password: None,
+                    client_unique_id: None,
+                    oidc_identity: None,
+                },
+            )
+            .await?;
+
+        info!(admin = is_admin, "synced oidc user role from group claim");
+
+        Ok(())
+    }
+
     pub async fn admin_role(&self) -> Result<Role, AppError> {
         let result = self
             .find_role(async |role| {

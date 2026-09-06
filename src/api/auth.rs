@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use std::{pin::Pin, time::Duration};
 use tracing::warn;
 
+use crate::app::oidc::is_admin_from_claims;
 use crate::app::{
     App, AppError,
     auth::{SessionToken, UserAuth},
@@ -298,7 +299,7 @@ async fn oidc_callback(
             return Ok(generic_oidc_bad_request(&app));
         }
     };
-    let user = match app
+    let mut user = match app
         .user_by_oidc_identity(verified.issuer, verified.subject, username)
         .await
     {
@@ -308,6 +309,14 @@ async fn oidc_callback(
             return Ok(generic_oidc_bad_request(&app));
         }
     };
+
+    // Role follows the identity providers group claim, re-evaluated each login.
+    if let Some(admin_group) = &config.admin_group {
+        let is_admin = is_admin_from_claims(&verified.claims, &config.groups_claim, admin_group);
+        if let Err(err) = app.sync_oidc_admin_role(&mut user, is_admin).await {
+            warn!("OIDC role sync failed: {err}");
+        }
+    }
 
     let session_expiration = app.config().web_server.session_cookie_expiration;
     let session = match user.new_session(session_expiration).await {
