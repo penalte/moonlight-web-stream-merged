@@ -4,7 +4,7 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use common::config::OidcConfig;
+use crate::config::OidcConfig;
 use openidconnect::{
     AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
     EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
@@ -351,7 +351,7 @@ fn oidc_http_client() -> Result<reqwest::Client, OidcError> {
         .map_err(|_| OidcError::ProviderRequest)
 }
 
-pub fn validate_oidc_startup_config(config: &common::config::Config) -> Result<(), anyhow::Error> {
+pub fn validate_oidc_startup_config(config: &crate::config::Config) -> Result<(), anyhow::Error> {
     let Some(oidc) = &config.web_server.oidc else {
         return Ok(());
     };
@@ -415,7 +415,7 @@ mod tests {
 
     use actix_web::{App as ActixApp, HttpResponse, HttpServer, web};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use common::config::OidcConfig;
+    use crate::config::OidcConfig;
     use openssl::{
         hash::MessageDigest,
         pkey::{PKey, Private},
@@ -866,7 +866,7 @@ mod tests {
 
     #[test]
     fn oidc_startup_config_requires_secure_urls_matching_callback_path() {
-        let mut config = common::config::Config::default();
+        let mut config = crate::config::Config::default();
         config.web_server.session_cookie_secure = true;
         config.web_server.oidc = Some(OidcConfig {
             issuer_url: "https://idp.example.com/realms/moonlight".to_string(),

@@ -406,10 +406,8 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use actix_web::{App as ActixApp, cookie::Cookie, http::StatusCode, test, web::Data};
-    use common::{
-        api_bindings::AuthMetadataResponse,
-        config::{Config, OidcConfig, StorageConfig},
-    };
+    use crate::api::bindings::AuthMetadataResponse;
+    use crate::config::{Config, OidcConfig, StorageConfig};
 
     use crate::{api::api_service, app::App};
 

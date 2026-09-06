@@ -831,7 +831,7 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use common::config::{Config, OidcConfig, StorageConfig};
+    use crate::config::{Config, OidcConfig, StorageConfig};
 
     use crate::app::{
         App,
