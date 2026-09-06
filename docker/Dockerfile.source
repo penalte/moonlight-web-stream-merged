@@ -21,9 +21,19 @@ RUN curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
 
 # ubrn builds the web bindings to wasm and needs wasm-bindgen-cli.
 # binstall fetches a prebuilt binary rather than compiling it from source.
+#
+# The version is pinned deliberately. wasm-bindgen requires the CLI and the
+# schema the .wasm was linked against to match EXACTLY; an unpinned install
+# grabs the newest CLI and fails with:
+#   rust Wasm file schema version: 0.2.122
+#      this binary schema version: 0.2.128
+# The value to match is the wasm-bindgen dependency of the crate ubrn checks
+# out into rust_modules/wasm (from moonlight-common-rust) -- NOT the 0.2.114
+# in this repository's Cargo.lock. Bump this when that crate bumps.
+ARG WASM_BINDGEN_VERSION=0.2.122
 RUN curl -L --proto '=https' --tlsv1.2 -sSf \
         https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
-    && cargo binstall --force --no-confirm wasm-bindgen-cli
+    && cargo binstall --force --no-confirm wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION"
 
 WORKDIR /build
 
