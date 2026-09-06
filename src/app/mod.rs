@@ -929,8 +929,7 @@ mod tests {
 
     #[actix_web::test]
     async fn oidc_mapping_auto_creates_default_role_user_with_identity_when_enabled() {
-        let mut config = test_config(true);
-        config.web_server.default_role_id = None;
+        let config = test_config(true);
         let app = App::new(config).await.expect("app should start");
 
         let mut mapped = app
