@@ -449,10 +449,7 @@ impl Host {
                 // the library's own unpair-on-error cleanup did not run. Tell
                 // the host to drop its pending pair session so a fresh attempt
                 // can start cleanly.
-                if matches!(
-                    err,
-                    AppError::PairingTimedOut | AppError::PairingCancelled
-                ) {
+                if matches!(err, AppError::PairingTimedOut | AppError::PairingCancelled) {
                     let mut user = user.clone();
                     match self
                         .use_request_client(&app, &mut user, async |_, host| host.unpair().await)

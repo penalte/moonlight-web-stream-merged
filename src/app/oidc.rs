@@ -3,8 +3,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use crate::config::OidcConfig;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use openidconnect::{
     AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
     EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
@@ -413,9 +413,9 @@ mod tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
+    use crate::config::OidcConfig;
     use actix_web::{App as ActixApp, HttpResponse, HttpServer, web};
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-    use crate::config::OidcConfig;
     use openssl::{
         hash::MessageDigest,
         pkey::{PKey, Private},

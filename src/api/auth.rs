@@ -405,9 +405,9 @@ async fn authenticate(_user: AuthenticatedUser) -> HttpResponse {
 mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use actix_web::{App as ActixApp, cookie::Cookie, http::StatusCode, test, web::Data};
     use crate::api::bindings::AuthMetadataResponse;
     use crate::config::{Config, OidcConfig, StorageConfig};
+    use actix_web::{App as ActixApp, cookie::Cookie, http::StatusCode, test, web::Data};
 
     use crate::{api::api_service, app::App};
 

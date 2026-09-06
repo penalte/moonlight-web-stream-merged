@@ -1,8 +1,8 @@
 use crate::api::bindings::{
-    PairFailReason, PostPairCancelRequest,
-    DeleteHostQuery, GetHostQuery, GetHostResponse, GetHostsResponse, PatchHostRequest,
-    PostCancelRequest, PostCancelResponse, PostHostRequest, PostHostResponse, PostPairRequest,
-    PostPairResponse1, PostPairResponse2, PostWakeUpRequest, UndetailedHost,
+    DeleteHostQuery, GetHostQuery, GetHostResponse, GetHostsResponse, PairFailReason,
+    PatchHostRequest, PostCancelRequest, PostCancelResponse, PostHostRequest, PostHostResponse,
+    PostPairCancelRequest, PostPairRequest, PostPairResponse1, PostPairResponse2,
+    PostWakeUpRequest, UndetailedHost,
 };
 use actix_web::{
     HttpResponse, delete, get, patch, post,
@@ -10,7 +10,9 @@ use actix_web::{
     web::{Data, Json, Query},
 };
 use futures::future::try_join_all;
-use moonlight_common::{crypto::rustcrypto::RustCryptoBackend, high::MoonlightClientError, http::pair::PairPin};
+use moonlight_common::{
+    crypto::rustcrypto::RustCryptoBackend, high::MoonlightClientError, http::pair::PairPin,
+};
 use tracing::warn;
 
 use crate::{
@@ -188,11 +190,7 @@ async fn pair_host(
     // ever sees a pin; `Host::pair` still guards atomically against races.
     if host.pair_in_progress()? {
         let (reason, detail) = pair_fail_reason(&AppError::PairingInProgress);
-        return Ok(StreamedResponse::new(PostPairResponse1::PairFailed {
-            reason,
-            detail,
-        })
-        .0);
+        return Ok(StreamedResponse::new(PostPairResponse1::PairFailed { reason, detail }).0);
     }
 
     let pin = PairPin::new_random(&RustCryptoBackend)?;
@@ -300,7 +298,10 @@ mod tests {
             reason_of(AppError::PairingCancelled),
             PairFailReason::Cancelled
         );
-        assert_eq!(reason_of(AppError::HostPaired), PairFailReason::AlreadyPaired);
+        assert_eq!(
+            reason_of(AppError::HostPaired),
+            PairFailReason::AlreadyPaired
+        );
     }
 
     #[test]
