@@ -1055,7 +1055,7 @@ class ViewerSidebar implements Component, Sidebar {
 
         [0x11, 0x12, 0x10, 0x5B].forEach(code => {
             if (this.stickyModifiers[code]) {
-                input.sendKey(false, code, 0); // Release via class-level input access
+                input.sendKey(false, code, emptyKeyModifiers()); // Release via class-level input access
                 this.stickyModifiers[code] = false;
                 
                 // Visual reset
@@ -1188,7 +1188,7 @@ class ViewerSidebar implements Component, Sidebar {
         const sendRawKey = (isDown: boolean, vkCode: number) => {
             const input = this.app.getStream()?.getInput();
             if (input) {
-                input.sendKey(isDown, vkCode, 0);
+                input.sendKey(isDown, vkCode, emptyKeyModifiers());
             }
         };
 
@@ -1495,10 +1495,10 @@ class ViewerSidebar implements Component, Sidebar {
 
         const modifiers = [0x11, 0x12, 0x10];
 
-        modifiers.forEach(key => input.sendKey(true, key, 0));
-        input.sendKey(true, vkCode, 0);
-        input.sendKey(false, vkCode, 0);
-        modifiers.forEach(key => input.sendKey(false, key, 0));
+        modifiers.forEach(key => input.sendKey(true, key, emptyKeyModifiers()));
+        input.sendKey(true, vkCode, emptyKeyModifiers());
+        input.sendKey(false, vkCode, emptyKeyModifiers());
+        modifiers.forEach(key => input.sendKey(false, key, emptyKeyModifiers()));
     }
 
     extended(): void {
