@@ -54,9 +54,9 @@ use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTCRtpHeaderExtensionCapability, RTPCodecType,
 };
 
-use crate::api::stream::apply_role_restrictions;
 use crate::api::stream::webrtc::convert::{into_webrtc_ice_candidate, into_webrtc_network_type};
 use crate::api::stream::webrtc::ice_servers::generate_ice_servers;
+use crate::api::stream::{apply_role_restrictions, resolve_stream_address};
 use crate::app::App;
 use crate::app::host::HostId;
 use crate::app::stream::{ExternalStreamEvent, Stream, StreamId};
@@ -416,6 +416,7 @@ pub async fn webrtc_post(
             MoonlightStreamSetup::launch_query_parameters(),
         )
         .await?;
+    let config = resolve_stream_address(config).await?;
 
     let moonlight_stream = match MoonlightStream::connect(
         config,
