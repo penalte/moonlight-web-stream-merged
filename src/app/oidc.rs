@@ -5,6 +5,10 @@ use std::{
 
 use crate::config::OidcConfig;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use moonlight_common::{
+    crypto::rustcrypto::{RustCryptoBackend, RustCryptoError},
+    http::pair::PairingCryptoBackend,
+};
 use openidconnect::{
     AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
     EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
@@ -12,7 +16,6 @@ use openidconnect::{
     core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
     reqwest,
 };
-use openssl::rand::rand_bytes;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -399,9 +402,9 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|addr| addr.is_loopback())
 }
 
-fn random_urlsafe() -> Result<String, openssl::error::ErrorStack> {
+fn random_urlsafe() -> Result<String, RustCryptoError> {
     let mut bytes = [0; OIDC_RANDOM_BYTES];
-    rand_bytes(&mut bytes)?;
+    RustCryptoBackend.random_bytes(&mut bytes)?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 

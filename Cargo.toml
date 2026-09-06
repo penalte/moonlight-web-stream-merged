@@ -76,3 +76,7 @@ windows-service = "=0.8.0"
 too_many_arguments = "allow"
 unwrap_used = "warn"
 todo = "warn"
+
+[dev-dependencies]
+# used only by the OIDC mock-IdP tests in src/app/oidc.rs (RSA JWT signing)
+openssl = "0.10"
