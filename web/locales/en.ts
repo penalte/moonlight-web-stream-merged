@@ -1,4 +1,4 @@
-import type { PairFailReason } from "../api_bindings.js"
+import type { PairFailReason } from "../api_bindings"
 export const en = {
     index: {
         appTitle: "Moonlight Web",
