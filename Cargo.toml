@@ -68,6 +68,10 @@ base64 = "0.22.1"
 url = "2.5.7"
 openidconnect = "4.0.1"
 
+# TURN REST API credential generation (coturn use-auth-secret)
+hmac = "0.12.1"
+sha1 = "0.10.6"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
 windows-service = "=0.8.0"

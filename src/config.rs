@@ -94,6 +94,9 @@ pub struct WebRtcConfig {
     pub network_types: Vec<WebRtcNetworkType>,
     #[serde(default = "default_include_loopback_candidates")]
     pub include_loopback_candidates: bool,
+    /// Generate time-limited TURN credentials instead of using static ones.
+    #[serde(default)]
+    pub turn_rest: Option<TurnRestConfig>,
 }
 
 impl Default for WebRtcConfig {
@@ -105,6 +108,7 @@ impl Default for WebRtcConfig {
             nat_1to1: None,
             network_types: default_network_types(),
             include_loopback_candidates: default_include_loopback_candidates(),
+            turn_rest: None,
         }
     }
 }
@@ -396,4 +400,31 @@ fn default_moonlight_http_port() -> u16 {
 
 fn default_pair_device_name() -> String {
     "roth".to_string()
+}
+
+/// Credentials for a coturn server running in `use-auth-secret` mode.
+///
+/// coturn's REST API scheme does not use fixed accounts: the username is
+/// `<unix-expiry>:<name>` and the password is the base64 of
+/// HMAC-SHA1(username, static-auth-secret). Both are derived per session, so
+/// nothing long-lived is handed to the browser and no credential can go stale
+/// in a config file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TurnRestConfig {
+    /// e.g. ["turns:turn.example.com:5349", "turn:turn.example.com:3478"]
+    pub urls: Vec<String>,
+    /// Must equal `static-auth-secret` in turnserver.conf.
+    pub secret: String,
+    #[serde(default = "default_turn_rest_ttl")]
+    pub ttl_seconds: u64,
+    /// Name embedded in the username; shows up in coturn's logs.
+    #[serde(default = "default_turn_rest_username")]
+    pub username: String,
+}
+
+fn default_turn_rest_ttl() -> u64 {
+    86400
+}
+fn default_turn_rest_username() -> String {
+    "moonlight".to_string()
 }

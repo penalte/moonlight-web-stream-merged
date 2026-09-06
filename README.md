@@ -509,6 +509,39 @@ echo     }
 echo ]
 ```
 
+### WebRTC Turn Rest
+Generates time-limited TURN credentials for a coturn server running in
+`use-auth-secret` mode, instead of storing a fixed username and password.
+
+coturn's REST scheme does not use accounts: the username is
+`<unix-expiry>:<name>` and the password is the base64 of
+HMAC-SHA1(username, secret). Credentials are minted per negotiation, so
+nothing long-lived is handed to the browser and no credential can go stale in
+the config file.
+
+```json
+{
+    "webrtc": {
+        "turn_rest": {
+            "urls": ["turns:turn.example.com:5349", "turn:turn.example.com:3478"],
+            "secret": "REPLACE_WITH_STATIC_AUTH_SECRET",
+            "ttl_seconds": 86400,
+            "username": "moonlight"
+        }
+    }
+}
+```
+
+Options:
+- `urls`: TURN URLs to advertise to the browser. Required.
+- `secret`: must equal `static-auth-secret` in `turnserver.conf`. Required.
+- `ttl_seconds`: credential lifetime in seconds. Defaults to `86400`.
+- `username`: name embedded in the generated username; shows up in coturn's logs. Defaults to `moonlight`.
+
+These are appended to `ice_servers`, so any STUN entries configured there still
+apply. If the secret is unusable the TURN entry is skipped and a direct or STUN
+connection is still attempted, rather than failing the stream.
+
 ### WebRTC Nat 1 to 1 ips
 This will advertise the ip as an ice candidate on the web server.
 It's recommended to set this but stun servers should figure out the public ip.
