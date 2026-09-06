@@ -27,11 +27,12 @@ use tracing::{error, info, warn};
 use crate::app::{
     auth::{SessionToken, UserAuth},
     host::HostId,
+    oidc::{OidcError, PendingOidcLogins, validate_oidc_startup_config},
     password::StoragePassword,
     role::{Role, RoleId},
     storage::{
-        Either, Storage, StorageHostModify, StorageRoleAdd, StorageRoleDefaultSettings,
-        StorageRolePermissions, StorageUserAdd, create_storage,
+        Either, Storage, StorageHostModify, StorageOidcIdentity, StorageRoleAdd,
+        StorageRoleDefaultSettings, StorageRolePermissions, StorageUserAdd, create_storage,
     },
     stream::{Stream, StreamId},
     user::{Admin, AuthenticatedUser, RoleType, User, UserId},
@@ -39,6 +40,7 @@ use crate::app::{
 
 pub mod auth;
 pub mod host;
+pub mod oidc;
 pub mod password;
 pub mod role;
 pub mod storage;
@@ -217,6 +219,7 @@ struct AppInner {
     /// uniqueid and never refreshes an existing entry), which makes every
     /// later attempt fail until Sunshine restarts.
     pairing_sessions: StdMutex<HashMap<HostId, tokio::sync::oneshot::Sender<()>>>,
+    oidc_pending_logins: PendingOidcLogins,
 }
 
 pub type RequestClient = TokioHyperClient;
@@ -227,12 +230,15 @@ pub struct App {
 
 impl App {
     pub async fn new(config: Config) -> Result<Self, anyhow::Error> {
+        validate_oidc_startup_config(&config)?;
+
         let app = AppInner {
             storage: create_storage(config.data_storage.clone()).await?,
             config,
             app_image_cache: Default::default(),
             streams: Default::default(),
             pairing_sessions: Default::default(),
+            oidc_pending_logins: Default::default(),
         };
         let inner = Arc::new(app);
 
@@ -276,6 +282,10 @@ impl App {
 
     // -- Users
 
+    pub fn oidc_pending_logins(&self) -> &PendingOidcLogins {
+        &self.inner.oidc_pending_logins
+    }
+
     /// Handles all logic related to adding the first user:
     /// - Is this even currently allowed?
     /// - Moving hosts from global to first user
@@ -301,6 +311,7 @@ impl App {
                 password: Some(StoragePassword::new(&password)?),
                 role_id: admin_role.id(),
                 client_unique_id: username,
+                oidc_identity: None,
             })
             .await?;
 
@@ -415,6 +426,7 @@ impl App {
                                 name: username.clone(),
                                 password: None,
                                 client_unique_id: username.clone(),
+                                oidc_identity: None,
                             })
                             .await?;
 
@@ -425,6 +437,85 @@ impl App {
 
                 user.authenticate(&auth).await
             }
+        }
+    }
+
+    pub async fn user_by_oidc_identity(
+        &self,
+        issuer: String,
+        subject: String,
+        username: String,
+    ) -> Result<AuthenticatedUser, OidcError> {
+        if issuer.is_empty() || subject.is_empty() {
+            return Err(OidcError::InvalidIdToken);
+        }
+        if username.is_empty() {
+            return Err(OidcError::MissingUsernameClaim);
+        }
+
+        let Some(config_oidc) = &self.config().web_server.oidc else {
+            return Err(OidcError::NotConfigured);
+        };
+
+        match self
+            .inner
+            .storage
+            .get_user_by_oidc_identity(&issuer, &subject)
+            .await
+        {
+            Ok((id, user)) => Ok(AuthenticatedUser {
+                inner: User {
+                    app: self.new_ref(),
+                    id,
+                    cache_storage: user.map(Arc::new),
+                },
+            }),
+            Err(AppError::UserNotFound) if config_oidc.auto_create_missing_user => {
+                if self.user_by_name(&username).await.is_ok() {
+                    return Err(OidcError::UsernameCollision);
+                }
+                let role = self
+                    .default_role()
+                    .await
+                    .map_err(|_| OidcError::MissingUser)?;
+                match self
+                    .add_user_no_auth(StorageUserAdd {
+                        role_id: role.id(),
+                        name: username.clone(),
+                        password: None,
+                        client_unique_id: username,
+                        oidc_identity: Some(StorageOidcIdentity {
+                            issuer: issuer.clone(),
+                            subject: subject.clone(),
+                        }),
+                    })
+                    .await
+                {
+                    Ok(user) => Ok(user),
+                    Err(AppError::UserAlreadyExists) => {
+                        // A concurrent callback for the same identity may have
+                        // provisioned the account after our initial lookup.
+                        match self
+                            .inner
+                            .storage
+                            .get_user_by_oidc_identity(&issuer, &subject)
+                            .await
+                        {
+                            Ok((id, user)) => Ok(AuthenticatedUser {
+                                inner: User {
+                                    app: self.new_ref(),
+                                    id,
+                                    cache_storage: user.map(Arc::new),
+                                },
+                            }),
+                            _ => Err(OidcError::UsernameCollision),
+                        }
+                    }
+                    Err(_) => Err(OidcError::MissingUser),
+                }
+            }
+            Err(AppError::UserNotFound) => Err(OidcError::MissingUser),
+            Err(_) => Err(OidcError::MissingUser),
         }
     }
 
@@ -730,5 +821,290 @@ impl App {
             .storage
             .set_default_role(role.map(Role::id))
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    use common::config::{Config, OidcConfig, StorageConfig};
+
+    use crate::app::{
+        App,
+        oidc::OidcError,
+        role::RoleId,
+        storage::{
+            StorageOidcIdentity, StorageRoleAdd, StorageRoleDefaultSettings,
+            StorageRolePermissions, StorageUserAdd,
+        },
+        user::RoleType,
+    };
+
+    fn test_config(auto_create_missing_user: bool) -> Config {
+        let mut config = Config::default();
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        config.data_storage = StorageConfig::Json {
+            path: std::env::temp_dir()
+                .join(format!("moonlight-web-stream-oidc-app-test-{suffix}.json"))
+                .display()
+                .to_string(),
+            session_expiration_check_interval: Duration::from_secs(60),
+        };
+        config.web_server.session_cookie_secure = true;
+        config.web_server.oidc = Some(OidcConfig {
+            issuer_url: "https://idp.example.com/realms/moonlight".to_string(),
+            client_id: "moonlight-web".to_string(),
+            client_secret: None,
+            redirect_url: "https://example.com/api/oidc/callback".to_string(),
+            scopes: vec!["openid".to_string(), "profile".to_string()],
+            username_claim: "preferred_username".to_string(),
+            auto_create_missing_user,
+            display_label: "OpenID Connect".to_string(),
+        });
+        config
+    }
+
+    #[actix_web::test]
+    async fn oidc_mapping_rejects_existing_local_user_with_same_username() {
+        let app = App::new(test_config(false))
+            .await
+            .expect("app should start");
+        let admin_role = app
+            .add_role_no_auth(StorageRoleAdd {
+                name: "Admin".to_string(),
+                ty: RoleType::Admin,
+                default_settings: StorageRoleDefaultSettings::default(),
+                permissions: StorageRolePermissions::default(),
+            })
+            .await
+            .expect("role should be created");
+        let _existing = app
+            .add_user_no_auth(StorageUserAdd {
+                role_id: admin_role.id(),
+                name: "alice".to_string(),
+                password: Some(
+                    crate::app::password::StoragePassword::new("password")
+                        .expect("password should hash"),
+                ),
+                client_unique_id: "alice".to_string(),
+                oidc_identity: None,
+            })
+            .await
+            .expect("user should be created");
+
+        let result = app
+            .user_by_oidc_identity(
+                "https://idp.example.com/realms/moonlight".to_string(),
+                "subject-1".to_string(),
+                "alice".to_string(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(OidcError::MissingUser)));
+    }
+
+    #[actix_web::test]
+    async fn oidc_mapping_rejects_missing_user_when_auto_create_disabled() {
+        let app = App::new(test_config(false))
+            .await
+            .expect("app should start");
+
+        let result = app
+            .user_by_oidc_identity(
+                "https://idp.example.com/realms/moonlight".to_string(),
+                "subject-1".to_string(),
+                "alice".to_string(),
+            )
+            .await;
+
+        assert!(matches!(result, Err(OidcError::MissingUser)));
+    }
+
+    #[actix_web::test]
+    async fn oidc_mapping_auto_creates_default_role_user_with_identity_when_enabled() {
+        let mut config = test_config(true);
+        config.web_server.default_role_id = None;
+        let app = App::new(config).await.expect("app should start");
+
+        let mut mapped = app
+            .user_by_oidc_identity(
+                "https://idp.example.com/realms/moonlight".to_string(),
+                "subject-1".to_string(),
+                "alice".to_string(),
+            )
+            .await
+            .expect("missing user should be created");
+
+        let mapped_id = mapped.id();
+        assert_eq!(
+            mapped
+                .detailed_user()
+                .await
+                .expect("details should load")
+                .name,
+            "alice"
+        );
+        assert_ne!(mapped.role_id().await.expect("role should load"), RoleId(0));
+
+        let stored = app
+            .user_by_id(mapped_id)
+            .await
+            .expect("stored user should load");
+        let storage = app
+            .inner
+            .storage
+            .get_user(stored.id())
+            .await
+            .expect("storage user should load");
+        assert_eq!(
+            storage.oidc_identity,
+            Some(StorageOidcIdentity {
+                issuer: "https://idp.example.com/realms/moonlight".to_string(),
+                subject: "subject-1".to_string(),
+            })
+        );
+    }
+
+    #[actix_web::test]
+    async fn oidc_mapping_rejects_username_collision_between_subjects() {
+        let app = App::new(test_config(true)).await.expect("app should start");
+        let first = app
+            .user_by_oidc_identity(
+                "https://idp.example.com/realms/moonlight".to_string(),
+                "subject-1".to_string(),
+                "alice".to_string(),
+            )
+            .await
+            .expect("first subject should provision");
+
+        let second = app
+            .user_by_oidc_identity(
+                "https://idp.example.com/realms/moonlight".to_string(),
+                "subject-2".to_string(),
+                "alice".to_string(),
+            )
+            .await;
+
+        assert!(matches!(second, Err(OidcError::UsernameCollision)));
+        assert_eq!(
+            first.id(),
+            app.user_by_name("alice")
+                .await
+                .expect("alice should still resolve by local username")
+                .id()
+        );
+    }
+
+    #[actix_web::test]
+    async fn oidc_mapping_reuses_identity_when_username_claim_changes() {
+        let app = App::new(test_config(true)).await.expect("app should start");
+        let first = app
+            .user_by_oidc_identity(
+                "https://idp.example.com/realms/moonlight".to_string(),
+                "subject-1".to_string(),
+                "alice".to_string(),
+            )
+            .await
+            .expect("first login should provision");
+        let second = app
+            .user_by_oidc_identity(
+                "https://idp.example.com/realms/moonlight".to_string(),
+                "subject-1".to_string(),
+                "renamed-alice".to_string(),
+            )
+            .await
+            .expect("same identity should map");
+
+        assert_eq!(first.id(), second.id());
+    }
+
+    #[actix_web::test]
+    async fn concurrent_oidc_provisioning_reuses_one_identity() {
+        let app = App::new(test_config(true)).await.expect("app should start");
+
+        let first = app.user_by_oidc_identity(
+            "https://idp.example.com/realms/moonlight".to_string(),
+            "subject-concurrent".to_string(),
+            "concurrent-alice".to_string(),
+        );
+        let second = app.user_by_oidc_identity(
+            "https://idp.example.com/realms/moonlight".to_string(),
+            "subject-concurrent".to_string(),
+            "concurrent-alice".to_string(),
+        );
+        let (first, second) = tokio::join!(first, second);
+
+        let first = first.expect("first callback should resolve");
+        let second = second.expect("concurrent callback should resolve");
+        assert_eq!(first.id(), second.id());
+    }
+
+    #[actix_web::test]
+    async fn old_json_without_oidc_identity_loads() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "moonlight-web-stream-oidc-old-json-test-{suffix}.json"
+        ));
+        fs::write(
+            &path,
+            r#"{
+                "version": "3",
+                "users": {
+                    "1": {
+                        "role_id": 1,
+                        "name": "alice",
+                        "password": null,
+                        "client_unique_id": "alice"
+                    }
+                },
+                "hosts": {},
+                "roles": {
+                    "1": {
+                        "name": "User",
+                        "ty": "User",
+                        "default_settings": {},
+                        "permissions": {
+                            "allow_add_hosts": true,
+                            "maximum_bitrate_kbps": null,
+                            "allow_codec_h264": true,
+                            "allow_codec_h265": true,
+                            "allow_codec_av1": true,
+                            "allow_hdr": true,
+                            "allow_transport_webrtc": true,
+                            "allow_transport_websockets": true
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("old json should be written");
+
+        let mut config = test_config(false);
+        config.data_storage = StorageConfig::Json {
+            path: path.display().to_string(),
+            session_expiration_check_interval: Duration::from_secs(60),
+        };
+        let app = App::new(config).await.expect("old json should load");
+        let storage = app
+            .inner
+            .storage
+            .get_user_by_name("alice")
+            .await
+            .expect("old user should load")
+            .1
+            .expect("old user should be returned");
+
+        assert_eq!(storage.oidc_identity, None);
+        let _ = fs::remove_file(path);
     }
 }

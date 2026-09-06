@@ -63,6 +63,11 @@ pbkdf2 = { version = "0.13.0", features = ["sha2"] }
 uuid = { version = "1.24.0" }
 hex = { version = "0.4.3" }
 
+# OIDC (PR #156)
+base64 = "0.22.1"
+url = "2.5.7"
+openidconnect = "4.0.1"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
 windows-service = "=0.8.0"
