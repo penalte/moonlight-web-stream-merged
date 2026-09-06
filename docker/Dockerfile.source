@@ -1,0 +1,71 @@
+# Builds moonlight-web from source, unlike ./Dockerfile which downloads a
+# published release binary. Use this to test a branch that has no release yet.
+#
+#   docker build -f docker/Dockerfile.source -t moonlight-web:test .
+#
+# Context is the repository root, not ./docker.
+
+# ---------- builder ----------
+FROM rust:1.96-bookworm AS builder
+
+# moonlight-common-c is a C library pulled in via the moonlight-common git
+# dependency, so the C toolchain has to be present for the cargo build.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential cmake clang pkg-config libssl-dev git python3 ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Node 26, matching .github/workflows/ci.yml
+RUN curl -fsSL https://deb.nodesource.com/setup_26.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# ubrn builds the web bindings to wasm and needs wasm-bindgen-cli.
+# binstall fetches a prebuilt binary rather than compiling it from source.
+RUN curl -L --proto '=https' --tlsv1.2 -sSf \
+        https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
+    && cargo binstall --force --no-confirm wasm-bindgen-cli
+
+WORKDIR /build
+
+# rust-toolchain.toml pins 1.96.0 and the wasm32 target; install the toolchain
+# before the source is copied so this layer caches across source changes.
+COPY rust-toolchain.toml ./
+RUN rustup show && rustup target add wasm32-unknown-unknown
+
+COPY . .
+
+# The server binary.
+RUN cargo build --release --locked
+
+# The web bundle. 'npm run build' runs prebuild first, which generates the
+# TypeScript API bindings (cargo test export_bindings) and the uniffi web
+# bindings (ubrn checkout && ubrn build web), then webpack emits to dist/.
+RUN npm ci && npm run build
+
+# ---------- runtime ----------
+FROM debian:bookworm-slim
+
+ENV MOONLIGHT_WEB_PATH=/moonlight-web
+ENV WEBRTC_PORT_RANGE=40000:40100
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r moonlight && useradd -r -g moonlight -d ${MOONLIGHT_WEB_PATH} -s /sbin/nologin moonlight
+
+WORKDIR ${MOONLIGHT_WEB_PATH}
+
+COPY --from=builder /build/target/release/web-server ${MOONLIGHT_WEB_PATH}/web-server
+COPY --from=builder /build/dist ${MOONLIGHT_WEB_PATH}/static
+COPY docker/entrypoint.sh /entrypoint.sh
+
+RUN chmod +x ${MOONLIGHT_WEB_PATH}/web-server /entrypoint.sh \
+    && mkdir -p ${MOONLIGHT_WEB_PATH}/server \
+    && chown -R moonlight:moonlight ${MOONLIGHT_WEB_PATH}
+
+VOLUME ${MOONLIGHT_WEB_PATH}/server
+EXPOSE 8080 40000-40100/udp
+
+USER moonlight
+ENTRYPOINT ["/entrypoint.sh"]
