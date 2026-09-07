@@ -1004,3 +1004,44 @@ canvas.video-stream {
 .role-info-delete {
     background-color: red;
 }
+/* --- Sign-in card (see standard.css for the rationale) --- */
+
+.modal-background:has(.login-form) {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.modal-content:has(> .login-form) {
+    width: min(400px, 92vw);
+    margin: 0;
+    padding: 32px 24px;
+    border-radius: 12px;
+    max-height: none;
+    overflow: visible;
+}
+
+.login-form {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    text-align: center;
+}
+
+.login-form h3 {
+    margin: 0;
+    font-size: 1.5rem;
+}
+
+.login-form input {
+    width: 100%;
+    margin: 0;
+    box-sizing: border-box;
+}
+
+.login-form button {
+    width: 100%;
+    margin: 0;
+    padding: 14px;
+    font-weight: 600;
+}

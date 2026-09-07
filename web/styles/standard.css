@@ -1395,3 +1395,69 @@ canvas.video-stream {
 .role-info-delete {
     background-color: red;
 }
+/* --- Sign-in card -------------------------------------------------------
+   .modal-content is a wide panel sized for the settings and pairing
+   dialogs (width: 80%, margin: 15% auto). A sign-in card holding one
+   button wants the opposite, so these rules scope to .login-form via
+   :has() and leave every other modal untouched. */
+
+.modal-background:has(.login-form) {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(0, 8, 20, 0.72);
+    backdrop-filter: blur(6px);
+}
+
+.modal-content:has(> .login-form) {
+    width: min(400px, 92vw);
+    margin: 0;
+    padding: var(--space-xl) var(--space-lg);
+    background: linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 100%);
+    border: 1px solid rgba(0, 212, 255, 0.35);
+    border-radius: 16px;
+    box-shadow:
+        0 18px 50px rgba(0, 0, 0, 0.55),
+        inset 0 0 0 1px rgba(0, 212, 255, 0.08);
+    max-height: none;
+    overflow: visible;
+}
+
+.login-form {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+    text-align: center;
+}
+
+.login-form h3 {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 600;
+    color: var(--text-2);
+}
+
+.login-form input {
+    width: 100%;
+    margin: 0;
+    box-sizing: border-box;
+}
+
+.login-form input[type="file"] {
+    font-size: 0.9rem;
+    color: var(--text-1);
+}
+
+.login-form button {
+    width: 100%;
+    margin: 0;
+    padding: var(--space-md);
+    font-size: 1.05rem;
+    font-weight: 600;
+    background-color: var(--accent-cyan);
+    border-color: var(--accent-cyan-2);
+}
+
+.login-form button:hover {
+    background-color: var(--accent-cyan-2);
+}

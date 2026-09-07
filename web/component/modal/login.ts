@@ -117,6 +117,7 @@ export class ApiUserPasswordPrompt extends FormModal<UserAuth> {
     }
 
     mountForm(form: HTMLFormElement): void {
+        form.classList.add("login-form")
         form.appendChild(this.text)
 
         if (this.passwordLogin) {
