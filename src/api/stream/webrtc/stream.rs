@@ -147,13 +147,26 @@ pub async fn webrtc_loop(
                         }
                     },
                     ControlChannelEvent::Closed => {
-                        info!("control channel closed");
+                        warn!("control channel closed or stalled; disconnecting stream");
+                        let _ = stream.disconnect();
+                        break;
                     },
                 }
             }
         }
     }
 
+    // Pump the native transport briefly so its queued disconnect reaches Sunshine.
+    // Dropping it immediately can leave remote input held until the host times out.
+    let _ = stream.disconnect();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while stream.is_alive() {
+            if stream.drive().await.is_err() {
+                break;
+            }
+        }
+    })
+    .await;
     Ok(())
 }
 
@@ -163,8 +176,6 @@ fn send_key_change(
     key_code: KeyCode,
     action: KeyAction,
 ) {
-    info!(action = ?action, key_code = ?key_code, "test");
-
     let mouse_button = match key_code {
         KeyCode::VK_LBUTTON => Some(MouseButton::Left),
         KeyCode::VK_MBUTTON => Some(MouseButton::Middle),

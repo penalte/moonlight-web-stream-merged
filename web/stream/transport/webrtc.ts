@@ -1,9 +1,7 @@
 import { Api, fetchApi, WebRTCAnswer } from "../../api"
-import { StreamKeys } from "../../api_bindings"
-import { InputBatcher, ClientInputEvent, ClientInputEvent_Tags, ControlPacket, ControlPacketConfig, controlPacketDeserialize, controlPacketSerialize, KeyAction, KeyModifiers, keyStatesCanStore, keyStatesEmpty, keyStatesSetPressed, MouseButton, MouseButtonAction, PacketDirection, VideoFormats, WebRtcSessionAnswer, webrtcSessionAnswerParse, WebRtcSessionOffer, webrtcSessionOfferApply } from "../../uniffi/moonlight_common_bindings"
+import { InputBatcher, ClientInputEvent, ClientInputEvent_Tags, ControlPacket, ControlPacketConfig, controlPacketDeserialize, controlPacketSerialize, PacketDirection, VideoFormats, WebRtcSessionAnswer, webrtcSessionAnswerParse, WebRtcSessionOffer, webrtcSessionOfferApply } from "../../uniffi/moonlight_common_bindings"
 import { globalObject, wait } from "../../util"
 import { AudioPlayer, TrackAudioPlayer } from "../audio/index"
-import { U16_MAX } from "../buffer"
 import { Logger } from "../log"
 import { DataPipe } from "../pipeline/pipes"
 import { StatValue } from "../stats"
@@ -24,6 +22,13 @@ export class WebRTCTransport implements Transport {
 
     private peer: RTCPeerConnection
     private location: string | null = null
+    private healthTimer: number | null = null
+    private checkingHealth = false
+    private disconnectedSince: number | null = null
+    private lastHealthCheck = 0
+    private lastVideoProgress = 0
+    private healthFrames: number | null = null
+    private reportedVideoStall = false
 
     constructor(api: Api, configuration: RTCConfiguration, logger?: Logger) {
         this.logger = logger
@@ -32,7 +37,7 @@ export class WebRTCTransport implements Transport {
 
         // Create peer
         this.peer = new RTCPeerConnection(configuration)
-        this.controlStream = new WebRtcControlStream(this.peer)
+        this.controlStream = new WebRtcControlStream(this.peer, logger, reason => this.fail(reason))
 
         this.logger?.debug(`Using ice servers ${JSON.stringify(configuration.iceServers?.flatMap(server => server.urls))}`)
 
@@ -50,6 +55,7 @@ export class WebRTCTransport implements Transport {
 
         // Dummy data channel required so that the answerer knows we accept data channels
         this.peer.createDataChannel("dummy")
+        this.healthTimer = globalObject().setInterval(() => void this.checkHealth(), 2000)
     }
 
     private sdpOfferOptions: WebRtcSessionOffer | null = null
@@ -143,22 +149,61 @@ export class WebRTCTransport implements Transport {
         return this.connectData
     }
 
+    private async checkHealth() {
+        if (this.closed || this.checkingHealth || !this.wasConnected) return
+        this.checkingHealth = true
+        try {
+            const now = performance.now()
+            if (this.peer.connectionState == "disconnected") {
+                this.disconnectedSince ??= now
+                if (now - this.disconnectedSince >= 10000) {
+                    this.fail("WebRTC remained disconnected for ten seconds")
+                    return
+                }
+            } else this.disconnectedSince = null
+            const stats = await this.getStats()
+            if (this.closed) return
+            const frames = typeof stats.framesDecoded == "number" ? stats.framesDecoded : null
+            // Hidden pages may legitimately stop presenting video. Reset the observation window.
+            if (document.visibilityState != "visible" || now - this.lastHealthCheck > 5000 || frames != this.healthFrames) {
+                this.lastVideoProgress = now
+                this.reportedVideoStall = false
+            }
+            this.lastHealthCheck = now
+            this.healthFrames = frames
+            if (!this.reportedVideoStall && now - this.lastVideoProgress >= 15000) {
+                this.logger?.debug("WebRTC frozen-stream diagnostics: " + JSON.stringify(stats))
+                this.reportedVideoStall = true
+                this.logger?.debug("No video decoding progress for fifteen seconds; checking connection health independently")
+            }
+        } catch (error) {
+            this.logger?.debug("WebRTC health statistics unavailable: " + error)
+        } finally {
+            this.checkingHealth = false
+        }
+    }
+
+    private fail(reason: string) {
+        if (this.closed) return
+        this.logger?.debug(reason)
+        this.onclose?.(this.wasConnected ? "failed" : "failednoconnect")
+        void this.close()
+    }
     private wasConnected = false
     private onStateChange() {
+        this.logger?.debug(`WebRTC state: peer=${this.peer.connectionState}, ice=${this.peer.iceConnectionState}, sctp=${this.peer.sctp?.state ?? "unavailable"}`)
+        if (this.closed) return
         if (this.peer.connectionState == "connected") {
+            if (this.wasConnected) return
             this.wasConnected = true
 
             this.generateConnectData().then(connectData => {
-                if (this.onconnect) {
+                if (!this.closed && this.onconnect) {
                     this.onconnect(connectData)
                 }
-            })
+            }).catch(error => this.fail("WebRTC setup failed: " + error))
         } else if (this.peer.connectionState == "failed" || this.peer.connectionState == "closed") {
-            const shutdown = this.wasConnected ? "failed" : "failednoconnect"
-
-            if (this.onclose) {
-                this.onclose(shutdown)
-            }
+            this.fail("WebRTC connection " + this.peer.connectionState)
         }
     }
 
@@ -284,6 +329,8 @@ export class WebRTCTransport implements Transport {
     async close(): Promise<void> {
         if (this.closed) return
         this.closed = true
+        if (this.healthTimer != null) globalObject().clearInterval(this.healthTimer)
+        this.healthTimer = null
         this.controlStream.close()
         // Close the peer
         this.peer.close()
@@ -316,13 +363,15 @@ export class WebRTCTransport implements Transport {
                 if ("type" in value && "kind" in value
                     && value.type == "inbound-rtp" && value.kind == "video"
                 ) {
-
+                    const codec = stats.get(value.codecId)?.mimeType?.toLowerCase()
+                    if (codec == "video/h264") return "h264"
+                    if (codec == "video/h265") return "h265"
+                    if (codec == "video/av1") return "av1Main8"
                 }
             }
             tries += 1
             if (tries > 10) {
-                this.logger?.debug(`failed to determine codec using stats after ${tries} tries, assuming h264`)
-                return "h264"
+                throw new Error("No negotiated video codec appeared in WebRTC receiver statistics")
             }
 
             await wait(100)
@@ -334,13 +383,19 @@ export class WebRTCTransport implements Transport {
     async getStats(): Promise<Record<string, StatValue>> {
         const out: Record<string, StatValue> = {}
 
-        // Control Stream
-        // TODO
+        Object.assign(out, this.controlStream.getStats())
+        out.peerState = this.peer.connectionState
+        out.iceState = this.peer.iceConnectionState
+        out.sctpState = this.peer.sctp?.state ?? "unavailable"
 
         const stats = await this.peer.getStats()
 
         for (const [_key, value] of stats) {
-            console.debug(value)
+            if (value.type == "candidate-pair" && value.state == "succeeded" && value.nominated) {
+                out.connectionRttMs = value.currentRoundTripTime * 1000
+                out.localCandidateType = stats.get(value.localCandidateId)?.candidateType
+                out.remoteCandidateType = stats.get(value.remoteCandidateId)?.candidateType
+            }
 
             // Video Stream
             if ("type" in value && "kind" in value
@@ -360,7 +415,8 @@ export class WebRTCTransport implements Transport {
                 out.firCount = value?.firCount
 
                 if ("totalDecodeTime" in value && "framesDecoded" in value) {
-                    out.decodeTimePerFrameMs = (value.totalDecodeTime - this.lastTotalDecodeTime) / (value.framesDecoded - this.lastFramesDecoded) * 1000.0
+                    out.decodeTimePerFrameMs = value.framesDecoded > this.lastFramesDecoded
+                        ? (value.totalDecodeTime - this.lastTotalDecodeTime) / (value.framesDecoded - this.lastFramesDecoded) * 1000.0 : 0
 
                     this.lastFramesDecoded = value.framesDecoded
                     this.lastTotalDecodeTime = value.totalDecodeTime
@@ -382,371 +438,170 @@ export class WebRTCTransport implements Transport {
     }
 }
 
+
 class WebRtcControlStream implements IControlStream {
-
-    private logger?: Logger
-
     private config: ControlPacketConfig | null = null
-
     private channel: RTCDataChannel | null = null
-    private mouseAbsolute: RTCDataChannel
     private mouse: RTCDataChannel
-    private keysCompact: RTCDataChannel
-    private keys: RTCDataChannel
-    private controller: RTCDataChannel
-
-    // Input Batching
-    private mouseState:
-        { x: number, y: number, referenceWidth: number, referenceHeight: number } |
-        { moveX: number, moveY: number }
-        = { moveX: 0, moveY: 0 }
-    private mouseScrollX = 0
-    private mouseScrollY = 0
-
-    private remoteKeyStates: Set<number> = new Set()
-    private currentPressedKeys: Set<number> = new Set()
-    private keyStatesSequenceNumber = 0
-
+    private mouseAbsolute: RTCDataChannel
     private controllerBatcher = new InputBatcher()
     private disposed = false
-
-    // Buffering
-    private packetBuffer: Array<ControlPacket> = []
-
-    constructor(peer: RTCPeerConnection, logger?: Logger) {
-        this.logger = logger
-
-
-        this.mouseAbsolute = peer.createDataChannel("moonlight.control.mouseAbsolute", {
-            ordered: false,
-        })
-        this.mouseAbsolute.bufferedAmountLowThreshold = this.maxBufferedAmount(this.mouseAbsolute)
-
-        this.mouse = peer.createDataChannel("moonlight.control.mouse", {
-            ordered: false,
-            maxPacketLifeTime: 30,
-        })
-        this.mouse.bufferedAmountLowThreshold = this.maxBufferedAmount(this.mouse)
-
-        this.keysCompact = peer.createDataChannel("moonlight.control.keysCompact", {
-            ordered: false,
-            maxRetransmits: 0,
-        })
-        this.keysCompact.bufferedAmountLowThreshold = this.maxBufferedAmount(this.keysCompact)
-
-        this.keys = peer.createDataChannel("moonlight.control.keys")
-        this.keys.bufferedAmountLowThreshold = this.maxBufferedAmount(this.keys)
-
-        this.controller = peer.createDataChannel("moonlight.control.controller", {
-            ordered: false,
-            maxRetransmits: 0,
-        })
-        this.controller.bufferedAmountLowThreshold = this.maxBufferedAmount(this.controller)
-
-        for (const channel of [this.mouseAbsolute, this.mouse, this.keysCompact, this.keys, this.controller]) {
-            channel.onbufferedamountlow = this.boundTrySendBufferedPackets
-        }
-
-        // Hook into frame loop for sending packets
-        globalObject().requestAnimationFrame(this.boundSendBatchedInputs)
-    }
-
-    private maxBufferedAmount(channel: RTCDataChannel): number {
-        switch (channel) {
-            case this.mouseAbsolute:
-            case this.mouse:
-            case this.keys:
-                return 512
-            case this.controller:
-                return 4 * 1024
-            case this.channel:
-                return 16 * 1024
-            default:
-                return 1024
-        }
-    }
-
-    setChannel(channel: RTCDataChannel | null, config?: ControlPacketConfig): void {
-        if (channel && config) {
-            this.channel = channel
-
-            this.config = config
-
-            this.channel.binaryType = "arraybuffer"
-
-            this.channel.addEventListener("open", this.boundTrySendBufferedPackets)
-            this.channel.addEventListener("bufferedamountlow", this.boundTrySendBufferedPackets)
-            this.channel.addEventListener("message", this.boundMessage)
-
-            this.channel.bufferedAmountLowThreshold = this.maxBufferedAmount(this.channel)
-
-            this.trySendBufferedPackets()
-        } else {
-            this.channel?.removeEventListener("open", this.boundTrySendBufferedPackets)
-            this.channel?.removeEventListener("bufferedamountlow", this.boundTrySendBufferedPackets)
-            this.channel?.removeEventListener("message", this.boundMessage)
-
-            this.channel = null
-        }
-    }
-
+    private packetBuffer: Array<{ packet: ControlPacket, queuedAt: number }> = []
+    private mouseState: { x: number, y: number, referenceWidth: number, referenceHeight: number } | { moveX: number, moveY: number } = { moveX: 0, moveY: 0 }
+    private mouseDirty = false
+    private timer: number | null = null
+    private blockedSince: number | null = null
+    private lastBufferedAmount = 0
+    private lastTick = performance.now()
+    private lastAbsoluteSend = 0
     onreceive: ((packet: ControlPacket) => void) | null = null
 
-    private boundMessage = this.onMessage.bind(this)
-    private onMessage(event: MessageEvent) {
-        if (!this.config) {
-            throw "packet config not configured, but a packet was received"
+    constructor(peer: RTCPeerConnection, private logger?: Logger, private onFailure: (reason: string) => void = () => {}) {
+        // Ordered partial reliability prevents old positions overtaking newer ones.
+        this.mouseAbsolute = peer.createDataChannel("moonlight.control.mouseAbsolute", { ordered: true, maxPacketLifeTime: 30 })
+        this.mouse = peer.createDataChannel("moonlight.control.mouse", { ordered: true, maxPacketLifeTime: 30 })
+        for (const channel of [this.mouseAbsolute, this.mouse]) {
+            channel.addEventListener("close", this.boundChannelFailure)
+            channel.addEventListener("error", this.boundChannelFailure)
         }
-
-        const packet = controlPacketDeserialize(this.config, PacketDirection.ClientBound, event.data)
-
-        if (packet && this.onreceive) {
-            this.onreceive(packet)
+        // Input scheduling must not depend on rendering animation frames.
+        this.timer = globalObject().setInterval(() => this.sendBatchedInputs(), 8)
+    }
+    private boundChannelFailure = () => this.fail("WebRTC control channel closed or failed")
+    private fail(reason: string) {
+        if (this.disposed) return
+        this.logger?.debug(reason)
+        this.close()
+        this.onFailure(reason)
+    }
+    getStats(): Record<string, StatValue> {
+        return {
+            controlState: this.channel?.readyState ?? "waiting",
+            controlBufferedBytes: this.channel?.bufferedAmount ?? 0,
+            controlPendingPackets: this.packetBuffer.length,
+            controlOldestPacketMs: this.packetBuffer.length ? performance.now() - this.packetBuffer[0].queuedAt : 0,
+            mouseBufferedBytes: this.mouse.bufferedAmount + this.mouseAbsolute.bufferedAmount,
         }
     }
-
-    send(input: ClientInputEvent): void {
-        switch (input.tag) {
-            case ClientInputEvent_Tags.MouseMoveAbsolute:
-                this.mouseState = {
-                    x: input.inner.x,
-                    y: input.inner.y,
-                    referenceWidth: input.inner.referenceWidth,
-                    referenceHeight: input.inner.referenceHeight,
-                }
-                break
-            case ClientInputEvent_Tags.MouseMoveRelative:
-                if ("moveX" in this.mouseState) {
-                    this.mouseState.moveX += input.inner.deltaX
-                    this.mouseState.moveY += input.inner.deltaY
-                } else {
-                    this.mouseState = {
-                        moveX: input.inner.deltaX,
-                        moveY: input.inner.deltaY
-                    }
-                }
-                break
-            case ClientInputEvent_Tags.MouseScrollVertical:
-                this.mouseScrollY += input.inner.scrollY
-                break
-            case ClientInputEvent_Tags.MouseScrollHorizontal:
-                this.mouseScrollX += input.inner.scrollX
-                break
-            case ClientInputEvent_Tags.MouseButton:
-                let keyCode = null
-                switch (input.inner.button) {
-                    case MouseButton.Left:
-                        keyCode = StreamKeys.VK_LBUTTON
-                        break
-                    case MouseButton.Middle:
-                        keyCode = StreamKeys.VK_MBUTTON
-                        break
-                    case MouseButton.Right:
-                        keyCode = StreamKeys.VK_RBUTTON
-                        break
-                    case MouseButton.X1:
-                        keyCode = StreamKeys.VK_XBUTTON1
-                        break
-                    case MouseButton.X2:
-                        keyCode = StreamKeys.VK_XBUTTON2
-                        break
-                }
-
-                if (keyCode) {
-                    if (input.inner.action == MouseButtonAction.Press) {
-                        this.currentPressedKeys.add(keyCode)
-                    } else {
-                        this.currentPressedKeys.delete(keyCode)
-                    }
-                }
-
-                this.sendKeysCompact()
-                break
-            case ClientInputEvent_Tags.Keyboard:
-                if (input.inner.action == KeyAction.Down) {
-                    this.currentPressedKeys.add(input.inner.keyCode)
-                } else {
-                    this.currentPressedKeys.delete(input.inner.keyCode)
-                }
-
-                this.sendKeysCompact()
-                break
-            case ClientInputEvent_Tags.ControllerConnect:
-            case ClientInputEvent_Tags.ControllerState:
-            case ClientInputEvent_Tags.ControllerDisconnect:
-                for (const packet of this.controllerBatcher.batchInput(input)) {
-                    this.sendRaw(packet)
-                }
-                break
-            case ClientInputEvent_Tags.Touch:
-                break
-            case ClientInputEvent_Tags.Pen:
-                break
+    setChannel(channel: RTCDataChannel | null, config?: ControlPacketConfig) {
+        if (this.channel) {
+            this.channel.removeEventListener("open", this.boundFlush)
+            this.channel.removeEventListener("bufferedamountlow", this.boundFlush)
+            this.channel.removeEventListener("message", this.boundMessage)
+            this.channel.removeEventListener("close", this.boundChannelFailure)
+            this.channel.removeEventListener("error", this.boundChannelFailure)
         }
-    }
-
-    sendRaw(packet: ControlPacket): void {
-        this.packetBuffer.push(packet)
-
+        this.channel = channel
+        if (!channel || !config) return
+        this.config = config
+        channel.binaryType = "arraybuffer"
+        channel.bufferedAmountLowThreshold = 512
+        channel.addEventListener("open", this.boundFlush)
+        channel.addEventListener("bufferedamountlow", this.boundFlush)
+        channel.addEventListener("message", this.boundMessage)
+        channel.addEventListener("close", this.boundChannelFailure)
+        channel.addEventListener("error", this.boundChannelFailure)
         this.trySendBufferedPackets()
     }
-
-    private boundTrySendBufferedPackets = this.trySendBufferedPackets.bind(this)
-    private trySendBufferedPackets() {
-        if (!this.channel) {
-            return
-        }
-
-        if (this.channel.readyState != "open") {
-            return
-        }
-
-        // Try to send packets
-        for (const packet of this.packetBuffer.splice(0)) {
-            this.trySendOn(this.channel, packet)
+    private boundMessage = (event: MessageEvent) => {
+        if (!this.config || this.disposed) return
+        const packet = controlPacketDeserialize(this.config, PacketDirection.ClientBound, event.data)
+        if (packet) this.onreceive?.(packet)
+    }
+    send(input: ClientInputEvent) {
+        if (this.disposed) return
+        switch (input.tag) {
+            case ClientInputEvent_Tags.MouseMoveAbsolute:
+                this.mouseState = { ...input.inner }
+                this.mouseDirty = true
+                return
+            case ClientInputEvent_Tags.MouseMoveRelative:
+                if (!("moveX" in this.mouseState)) this.mouseState = { moveX: 0, moveY: 0 }
+                this.mouseState.moveX += input.inner.deltaX
+                this.mouseState.moveY += input.inner.deltaY
+                return
+            case ClientInputEvent_Tags.MouseScrollVertical:
+                this.sendRaw(new ControlPacket.MouseScroll({ scrollAmount1: input.inner.scrollY, scrollAmount2: input.inner.scrollY, zero: 0 }))
+                return
+            case ClientInputEvent_Tags.MouseScrollHorizontal:
+                this.sendRaw(new ControlPacket.MouseHorizontalScroll({ scrollAmount: input.inner.scrollX }))
+                return
+            default:
+                // Preserve every key/button edge on one ordered reliable channel.
+                for (const packet of this.controllerBatcher.batchInput(input)) this.sendRaw(packet)
         }
     }
-
+    sendRaw(packet: ControlPacket) {
+        if (this.disposed) return
+        if (this.packetBuffer.length >= 256) {
+            this.fail("WebRTC input queue overflow; refusing delayed input replay")
+            return
+        }
+        this.packetBuffer.push({ packet, queuedAt: performance.now() })
+        this.trySendBufferedPackets()
+    }
+    private boundFlush = () => this.trySendBufferedPackets()
+    private trySendBufferedPackets() {
+        if (this.disposed) return
+        const now = performance.now()
+        if (this.packetBuffer.length && now - this.packetBuffer[0].queuedAt > 1000) {
+            this.fail("WebRTC input queue stalled for more than one second")
+            return
+        }
+        const buffered = this.channel?.bufferedAmount ?? 0
+        if (!buffered || buffered < this.lastBufferedAmount) this.blockedSince = null
+        this.lastBufferedAmount = buffered
+        if (buffered) {
+            this.blockedSince ??= now
+            if (now - this.blockedSince > 1000) {
+                this.fail("WebRTC control send buffer stopped draining for one second")
+                return
+            }
+        }
+        while (this.channel && this.packetBuffer.length) {
+            if (!this.trySendOn(this.channel, this.packetBuffer[0].packet)) break
+            this.packetBuffer.shift()
+        }
+    }
+    private sendBatchedInputs() {
+        if (this.disposed) return
+        const now = performance.now()
+        if (now - this.lastTick > 250 && "moveX" in this.mouseState) this.mouseState = { moveX: 0, moveY: 0 }
+        this.lastTick = now
+        this.trySendBufferedPackets()
+        if (this.disposed) return
+        if ("x" in this.mouseState) {
+            if ((this.mouseDirty || now - this.lastAbsoluteSend >= 100) && this.trySendOn(this.mouseAbsolute, new ControlPacket.MouseMoveAbsolute({ ...this.mouseState, unused: 0 }))) {
+                this.mouseDirty = false
+                this.lastAbsoluteSend = now
+            }
+        } else {
+            if (this.mouseState.moveX || this.mouseState.moveY) this.trySendOn(this.mouse, new ControlPacket.MouseMoveRelative({ deltaX: Math.max(-32768, Math.min(32767, this.mouseState.moveX)), deltaY: Math.max(-32768, Math.min(32767, this.mouseState.moveY)) }))
+            this.mouseState = { moveX: 0, moveY: 0 }
+        }
+    }
+    private trySendOn(channel: RTCDataChannel, packet: ControlPacket): boolean {
+        if (this.disposed || !this.config || channel.readyState != "open") return false
+        if (channel.bufferedAmount > (channel == this.channel ? 4096 : 512)) return false
+        const buffer = controlPacketSerialize(this.config, packet)
+        if (!buffer) return false
+        try {
+            channel.send(buffer)
+            return true
+        } catch (error) {
+            this.fail("WebRTC input send failed: " + error)
+            return false
+        }
+    }
     close() {
         this.disposed = true
+        if (this.timer != null) globalObject().clearInterval(this.timer)
+        this.timer = null
+        this.packetBuffer = []
         this.setChannel(null)
-    }
-
-    private boundSendBatchedInputs = this.sendBatchedInputs.bind(this)
-    private sendBatchedInputs() {
-        if (this.disposed || this.channel?.readyState == "closed") {
-            return
-        }
-        globalObject().requestAnimationFrame(this.boundSendBatchedInputs)
-
-        // -- Send mouse
-        if ("x" in this.mouseState) {
-            this.trySendOn(this.mouseAbsolute, new ControlPacket.MouseMoveAbsolute({
-                x: this.mouseState.x,
-                y: this.mouseState.y,
-                referenceWidth: this.mouseState.referenceWidth,
-                referenceHeight: this.mouseState.referenceHeight,
-                unused: 0,
-            }))
-        } else {
-            const notChanged = this.mouseState.moveX == 0 && this.mouseState.moveY == 0
-            const changed = !notChanged
-
-            if (changed) {
-                this.trySendOn(this.mouse, new ControlPacket.MouseMoveRelative({
-                    deltaX: this.mouseState.moveX,
-                    deltaY: this.mouseState.moveY
-                }))
-            }
-
-            this.mouseState = {
-                moveX: 0,
-                moveY: 0,
-            }
-        }
-
-        // -- Send Mouse Scroll
-        if (this.mouseScrollX != 0) {
-            this.trySendOn(this.mouseAbsolute, new ControlPacket.MouseHorizontalScroll({
-                scrollAmount: this.mouseScrollX
-            }))
-            this.mouseScrollX = 0
-        }
-        if (this.mouseScrollY != 0) {
-            this.trySendOn(this.mouseAbsolute, new ControlPacket.MouseScroll({
-                scrollAmount1: this.mouseScrollY,
-                scrollAmount2: this.mouseScrollY,
-                zero: 0,
-            }))
-            this.mouseScrollY = 0
-        }
-
-        this.sendKeysCompact()
-    }
-
-    private sendKeysCompact() {
-        // Get key modifiers for sending reliable keys as fallback
-        let modifiers = { alt: false, ctrl: false, meta: false, shift: false }
-        if (this.currentPressedKeys.has(StreamKeys.VK_SHIFT) || this.currentPressedKeys.has(StreamKeys.VK_LSHIFT) || this.currentPressedKeys.has(StreamKeys.VK_RSHIFT)) {
-            modifiers.shift = true
-        }
-        if (this.currentPressedKeys.has(StreamKeys.VK_LWIN) || this.currentPressedKeys.has(StreamKeys.VK_RWIN)) {
-            modifiers.meta = true
-        }
-        if (this.currentPressedKeys.has(StreamKeys.VK_CONTROL) || this.currentPressedKeys.has(StreamKeys.VK_LCONTROL) || this.currentPressedKeys.has(StreamKeys.VK_RCONTROL)) {
-            modifiers.ctrl = true
-        }
-        if (this.currentPressedKeys.has(StreamKeys.VK_MENU) || this.currentPressedKeys.has(StreamKeys.VK_LMENU) || this.currentPressedKeys.has(StreamKeys.VK_RMENU)) {
-            modifiers.alt = true
-        }
-
-        let keyStates = keyStatesEmpty()
-
-        // Go through pressed keys
-        for (const key of this.currentPressedKeys) {
-            if (keyStatesCanStore(keyStates, key)) {
-                keyStates = keyStatesSetPressed(keyStates, key, KeyAction.Down)
-            } else {
-                // only send reliable key press if the host doesn't know about it
-                if (this.remoteKeyStates.has(key)) {
-                    continue
-                }
-
-                this.trySendOn(this.keys, new ControlPacket.Keyboard({
-                    action: KeyAction.Down,
-                    flags: { sunshineNonNormalized: false },
-                    keyCode: key,
-                    modifiers,
-                    zero: 0,
-                }))
-
-                this.remoteKeyStates.add(key)
-            }
-        }
-
-        // Make a copy to not delete while iterating
-        const remoteKeyStates = [...this.remoteKeyStates]
-
-        for (const key of remoteKeyStates) {
-            if (!this.currentPressedKeys.has(key) && !keyStatesCanStore(keyStates, key)) {
-                this.trySendOn(this.keys, new ControlPacket.Keyboard({
-                    action: KeyAction.Up,
-                    flags: { sunshineNonNormalized: false },
-                    keyCode: key,
-                    modifiers,
-                    zero: 0,
-                }))
-
-                this.remoteKeyStates.delete(key)
-            }
-        }
-
-        // Send key states
-        this.trySendOn(this.keysCompact, new ControlPacket.WebState({
-            sequenceNumber: this.keyStatesSequenceNumber,
-            keys: keyStates
-        }))
-
-        if (this.keyStatesSequenceNumber >= U16_MAX - 1) {
-            this.keyStatesSequenceNumber = 0
-        }
-        this.keyStatesSequenceNumber += 1
-    }
-
-    private trySendOn(channel: RTCDataChannel, packet: ControlPacket) {
-        if (!this.config || channel.readyState != "open") {
-            return
-        }
-
-        if (channel.bufferedAmount > this.maxBufferedAmount(channel)) {
-            // Cannot send more packets because of buffered amount
-            // -> Drop the packet
-            return
-        }
-
-        const buffer = controlPacketSerialize(this.config, packet)
-        if (buffer) {
-            channel.send(buffer)
+        for (const channel of [this.mouseAbsolute, this.mouse]) {
+            channel?.removeEventListener("close", this.boundChannelFailure)
+            channel?.removeEventListener("error", this.boundChannelFailure)
         }
     }
 }

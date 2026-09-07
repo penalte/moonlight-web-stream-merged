@@ -655,7 +655,11 @@ class ViewerApp implements Component {
                     }
                 }
             } catch (e) {
-                console.warn("failed to set orientation to landscape", e)
+                if (e instanceof DOMException && e.name == "NotSupportedError") {
+                    console.debug("Landscape orientation lock is not supported on this device")
+                } else {
+                    console.warn("failed to set orientation to landscape", e)
+                }
             }
         } else {
             console.warn("root element not found")

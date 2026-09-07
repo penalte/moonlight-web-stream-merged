@@ -164,20 +164,25 @@ export class Stream implements Component {
         const desiredTransport = this.transportOverride ?? this.settings.dataTransport
         this.debugLog(`Using transport: ${desiredTransport}`)
 
+        let shutdownReason: TransportShutdown
         if (desiredTransport == "auto") {
-            let shutdownReason = await this.tryWebRTCTransport()
-
+            shutdownReason = await this.tryWebRTCTransport()
             if (shutdownReason == "failednoconnect") {
                 this.debugLog("Failed to establish WebRTC connection. Falling back to Web Socket transport.", { type: "ifErrorDescription" })
-                await this.tryWebSocketTransport()
+                shutdownReason = await this.tryWebSocketTransport()
             }
         } else if (desiredTransport == "webrtc") {
-            await this.tryWebRTCTransport()
-        } else if (desiredTransport == "websocket") {
-            await this.tryWebSocketTransport()
+            shutdownReason = await this.tryWebRTCTransport()
+        } else {
+            shutdownReason = await this.tryWebSocketTransport()
         }
-
-        this.debugLog("Tried all configured transport options but no connection was possible", { type: "fatal" })
+        if (shutdownReason == "disconnect") {
+            this.debugLog("Stream disconnected")
+        } else {
+            this.debugLog(shutdownReason == "failed"
+                ? "The stream connected, but the connection was lost. See the transport log for details."
+                : "Could not establish a connection using the configured transports.", { type: "fatal" })
+        }
     }
 
     private transport: Transport | null = null
@@ -297,17 +302,17 @@ export class Stream implements Component {
 
         return await onClose
     }
-    private async tryWebSocketTransport() {
+    private async tryWebSocketTransport(): Promise<TransportShutdown> {
         if (!this.permissions.allow_transport_websockets) {
             this.debugLog("Not trying WebSocket transport becaues permissions disallow it")
-            return
+            return "failednoconnect"
         }
 
         this.debugLog("Trying Web Socket transport")
 
         const options = await this.createTransportOptions()
         if (!options) {
-            return
+            return "failednoconnect"
         }
 
         const transport = new WebSocketTransport(this.api, this.logger)

@@ -68,7 +68,9 @@ test("gamepad connect, state and disconnect use the native batcher without throw
     const { WebRtcControlStream } = setup()
     const events = [], sent = []
     const control = Object.assign(Object.create(WebRtcControlStream.prototype), {
+        packetBuffer: [],
         controllerBatcher: {
+            removeBatchedInputs() { return [] },
             batchInput(event) {
                 events.push(event)
                 return [event]
