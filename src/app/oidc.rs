@@ -13,7 +13,7 @@ use openidconnect::{
     AccessTokenHash, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
     EndpointNotSet, EndpointSet, IssuerUrl, Nonce, OAuth2TokenResponse, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
-    core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata},
+    core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreProviderMetadata},
     reqwest,
 };
 use serde_json::Value;
@@ -300,6 +300,9 @@ pub async fn exchange_code_and_validate(
     }
 
     let claims = serde_json::to_value(claims).map_err(|_| OidcError::InvalidTokenResponse)?;
+    // openidconnect drops non-standard claims; put them back before use.
+    let claims = merge_raw_id_token_claims(id_token, claims);
+
     let issuer = claims
         .get("iss")
         .and_then(Value::as_str)
@@ -952,4 +955,35 @@ pub fn is_admin_from_claims(claims: &Value, groups_claim: &str, admin_group: &st
         Value::String(group) => group == admin_group,
         _ => false,
     }
+}
+
+/// Adds the id token's non-standard claims back into `claims`.
+///
+/// openidconnect models the id token as `IdTokenClaims<AdditionalClaims, _>`
+/// and flattens anything it does not recognise into the additional-claims
+/// type. The core aliases use `EmptyAdditionalClaims`, so provider-specific
+/// entries such as `groups` are dropped when the typed claims are serialised,
+/// while standard ones like `preferred_username` survive.
+///
+/// Rather than re-parameterise every client type, this re-reads the payload of
+/// the token whose signature, audience and nonce were verified immediately
+/// above, so the extra entries carry the same trust as the typed ones. Existing
+/// keys are never overwritten: the verified typed claims win on conflict.
+fn merge_raw_id_token_claims(id_token: &CoreIdToken, mut claims: Value) -> Value {
+    let token = id_token.to_string();
+    let Some(payload) = token.split('.').nth(1) else {
+        return claims;
+    };
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload) else {
+        return claims;
+    };
+    let Ok(Value::Object(raw)) = serde_json::from_slice::<Value>(&bytes) else {
+        return claims;
+    };
+    if let Value::Object(map) = &mut claims {
+        for (key, value) in raw {
+            map.entry(key).or_insert(value);
+        }
+    }
+    claims
 }
