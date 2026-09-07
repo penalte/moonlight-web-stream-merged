@@ -1149,24 +1149,34 @@ class ViewerSidebar implements Component, Sidebar {
         const clipboardButton = document.createElement("button")
         clipboardButton.innerText = "Clipboard"
         clipboardButton.addEventListener("click", async () => {
-            setSidebarExtended(false);
+            setSidebarExtended(false)
 
-            const textToSend = await showModal(new ClipboardModal());
+            const input = this.app.getStream()?.getInput()
+            if (!input) {
+                return
+            }
 
-            if (textToSend) {
-                const stream = this.app.getStream()?.getInput();
-                if (!stream) return;
+            // Read the local clipboard directly where the browser allows it.
+            // This needs a secure context plus the clipboard-read permission,
+            // which Chromium prompts for once and then remembers. Firefox still
+            // only exposes the clipboard during a real paste gesture, so fall
+            // back to asking for the text rather than failing.
+            let text: string | null = null
+            try {
+                text = await navigator.clipboard.readText()
+            } catch (err) {
+                console.debug("clipboard read unavailable, falling back to prompt", err)
+            }
 
-                // Use a conservative chunk size (e.g., 128) to avoid UTF-8 buffer overflow
-                const CHUNK_SIZE = 128;
+            if (!text) {
+                text = await showModal(new ClipboardModal())
+            }
 
-                for (let i = 0; i < textToSend.length; i += CHUNK_SIZE) {
-                    const chunk = textToSend.slice(i, i + CHUNK_SIZE);
-                    stream.sendText(chunk);
-                    await new Promise(resolve => setTimeout(resolve, 300));
-                }
-
-                console.log("📤 Transmitted via native sendText.");
+            if (text) {
+                // sendText already splits into UTF-8 safe 30 byte control
+                // packets, so the old 128 char slices with a 300ms sleep
+                // between them only made pasting slower.
+                input.sendText(text)
             }
         });
         this.buttonDiv.appendChild(clipboardButton)
