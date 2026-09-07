@@ -60,6 +60,8 @@ pub enum AppError {
     RoleNotFound,
     #[error("the role is still assigned to users")]
     RoleInUse,
+    #[error("demoting this role would leave nobody able to administer the server")]
+    LastAdminRole,
     #[error("more than one user already exists")]
     FirstUserAlreadyExists,
     #[error("the config option first_login_create_admin is not true")]
@@ -162,6 +164,7 @@ impl ResponseError for AppError {
                 HttpResponse::new(StatusCode::NOT_FOUND).set_body(BoxBody::new("role not found"))
             }
             Self::RoleInUse => HttpResponse::new(StatusCode::CONFLICT),
+            Self::LastAdminRole => HttpResponse::new(StatusCode::CONFLICT),
             Self::StreamClosed => {
                 HttpResponse::new(StatusCode::NOT_FOUND).set_body(BoxBody::new("stream not found"))
             }

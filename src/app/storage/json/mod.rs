@@ -496,10 +496,46 @@ impl Storage for JsonStorage {
         role_id: RoleId,
         modify: StorageRoleModify,
     ) -> Result<(), AppError> {
+        // Demoting the last occupied Admin role leaves nobody able to administer
+        // the server, and there is no API path back: admin_role() would recreate
+        // an empty Admin role that no one can be assigned to. Take the users lock
+        // first to keep the declared descending lock order.
+        let demoting = matches!(modify.ty, Some(RoleType::User));
+        let users = if demoting {
+            Some(self.users.read().await)
+        } else {
+            None
+        };
         let roles = self.roles.read().await;
 
         let role_lock = roles.get(&role_id.0).ok_or(AppError::RoleNotFound)?;
         let mut role = role_lock.write().await;
+
+        if let Some(users) = &users
+            && matches!(role.ty, V3RoleType::Admin)
+        {
+            let mut other_admin_roles = Vec::new();
+            for (other_id, other) in roles.iter() {
+                if *other_id != role_id.0 && matches!(other.read().await.ty, V3RoleType::Admin) {
+                    other_admin_roles.push(*other_id);
+                }
+            }
+
+            let mut occupied = false;
+            let mut admin_elsewhere = false;
+            for user in users.values() {
+                let user_role = user.read().await.role_id;
+                if user_role == role_id.0 {
+                    occupied = true;
+                } else if other_admin_roles.contains(&user_role) {
+                    admin_elsewhere = true;
+                }
+            }
+            // An empty Admin role can still be demoted: no user loses access.
+            if occupied && !admin_elsewhere {
+                return Err(AppError::LastAdminRole);
+            }
+        }
 
         if let Some(name) = modify.name {
             role.name = name;
@@ -984,6 +1020,60 @@ mod regression_tests {
             client_unique_id: name.into(),
             oidc_identity: None,
         }
+    }
+
+    async fn admin_role(storage: &JsonStorage, name: &str) -> RoleId {
+        storage
+            .add_role(StorageRoleAdd {
+                name: name.into(),
+                ty: RoleType::Admin,
+                default_settings: StorageRoleDefaultSettings::default(),
+                permissions: StorageRolePermissions::default(),
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    fn set_type(ty: RoleType) -> StorageRoleModify {
+        StorageRoleModify {
+            name: None,
+            ty: Some(ty),
+            default_settings: None,
+            permissions: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_last_occupied_admin_role_cannot_be_demoted() {
+        let storage = storage().await;
+        let admin = admin_role(&storage, "Admin").await;
+
+        // Nobody holds it yet, so demoting locks no one out.
+        storage
+            .modify_role(admin, set_type(RoleType::User))
+            .await
+            .unwrap();
+        storage
+            .modify_role(admin, set_type(RoleType::Admin))
+            .await
+            .unwrap();
+
+        // Once it is the only role an admin holds, demotion is refused: there
+        // would be no way back in.
+        storage.add_user(user(admin, "root")).await.unwrap();
+        assert!(matches!(
+            storage.modify_role(admin, set_type(RoleType::User)).await,
+            Err(AppError::LastAdminRole)
+        ));
+
+        // A second admin elsewhere makes it safe again.
+        let spare = admin_role(&storage, "Spare").await;
+        storage.add_user(user(spare, "backup")).await.unwrap();
+        storage
+            .modify_role(admin, set_type(RoleType::User))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
