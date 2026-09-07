@@ -112,6 +112,10 @@ export class ApiUserPasswordPrompt extends FormModal<UserAuth> {
         })
     }
 
+    protected override showFormButtons(): boolean {
+        return this.passwordLogin
+    }
+
     mountForm(form: HTMLFormElement): void {
         form.appendChild(this.text)
 

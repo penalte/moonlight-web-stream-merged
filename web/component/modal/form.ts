@@ -22,13 +22,22 @@ export abstract class FormModal<Output> implements Component, Modal<Output | nul
     abstract reset(): void
     abstract submit(): Output | null
 
+    /// Whether to render the OK and Cancel buttons. Subclasses whose form has
+    /// no submittable content can hide them, since submit() would return null
+    /// and cancel would only dismiss the dialog.
+    protected showFormButtons(): boolean {
+        return true
+    }
+
     abstract mountForm(form: HTMLFormElement): void
 
     mount(parent: Element): void {
         if (!this.mounted) {
             this.mountForm(this.formElement)
-            this.formElement.appendChild(this.submitButton)
-            this.formElement.appendChild(this.cancelButton)
+            if (this.showFormButtons()) {
+                this.formElement.appendChild(this.submitButton)
+                this.formElement.appendChild(this.cancelButton)
+            }
         }
 
         this.reset()
