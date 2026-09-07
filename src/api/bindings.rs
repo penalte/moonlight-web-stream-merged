@@ -30,6 +30,7 @@ pub struct PostLoginRequest {
 #[ts(export, export_to = EXPORT_PATH)]
 pub struct AuthMetadataResponse {
     pub oidc: Option<OidcAuthMetadata>,
+    pub password_login: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, TS, Clone, PartialEq, Eq)]

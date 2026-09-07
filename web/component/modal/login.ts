@@ -23,19 +23,22 @@ export class ApiUserPasswordPrompt extends FormModal<UserAuth> {
     private oidcLogin?: OidcLogin
     private oidcButton: HTMLButtonElement = document.createElement("button")
 
-    constructor(oidcLogin?: OidcLogin) {
+    private passwordLogin: boolean
+
+    constructor(oidcLogin?: OidcLogin, passwordLogin: boolean = true) {
         super()
         const i = getTranslations(getCurrentLanguage()).modal
 
         this.text.innerText = i.login
         this.oidcLogin = oidcLogin
+        this.passwordLogin = passwordLogin
 
         this.name = new InputComponent("ml-api-name", "text", i.username, {
-            formRequired: true
+            formRequired: passwordLogin
         })
 
         this.password = new InputComponent("ml-api-password", "password", i.password, {
-            formRequired: true
+            formRequired: passwordLogin
         })
 
         this.passwordFile = new InputComponent("ml-api-password-file", "file", i.passwordAsFile, { accept: ".txt" })
@@ -81,6 +84,9 @@ export class ApiUserPasswordPrompt extends FormModal<UserAuth> {
         this.passwordFile.reset()
     }
     submit(): UserAuth | null {
+        if (!this.passwordLogin) {
+            return null
+        }
         const name = this.name.getValue()
         const password = this.password.getValue()
 
@@ -109,10 +115,11 @@ export class ApiUserPasswordPrompt extends FormModal<UserAuth> {
     mountForm(form: HTMLFormElement): void {
         form.appendChild(this.text)
 
-        this.name.mount(form)
-
-        this.password.mount(form)
-        this.passwordFile.mount(form)
+        if (this.passwordLogin) {
+            this.name.mount(form)
+            this.password.mount(form)
+            this.passwordFile.mount(form)
+        }
 
         if (this.oidcLogin) {
             form.appendChild(this.oidcButton)

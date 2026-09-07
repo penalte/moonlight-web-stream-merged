@@ -123,6 +123,10 @@ async fn login(
     app: Data<App>,
     Json(request): Json<PostLoginRequest>,
 ) -> Result<HttpResponse, Error> {
+    if !app.config().web_server.password_login {
+        return Err(AppError::Unauthorized.into());
+    }
+
     let user = if app.config().web_server.first_login_create_admin {
         match app
             .try_add_first_login(request.name.clone(), request.password.clone())
@@ -189,7 +193,10 @@ async fn auth_metadata(app: Data<App>) -> HttpResponse {
 
     HttpResponse::Ok()
         .append_header(("Cache-Control", "no-store"))
-        .json(AuthMetadataResponse { oidc })
+        .json(AuthMetadataResponse {
+            oidc,
+            password_login: app.config().web_server.password_login,
+        })
 }
 
 #[derive(Debug, Deserialize)]

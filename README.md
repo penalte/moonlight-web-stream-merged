@@ -641,6 +641,24 @@ If multiple users match the given name, the request will fail.
 }
 ```
 
+### Password Login
+Allows username and password sign in. Defaults to `true`.
+
+Set it to `false` to make OpenID Connect the only way in: the login form drops
+the username, password and password-file inputs, leaving only the provider
+button, and `POST /login` rejects every request regardless of what a client
+sends. Configure and test `oidc` before turning this off, and note that it
+removes the local break-glass path - if the provider becomes unreachable the
+only way back in is editing this file on the server.
+
+```json
+{
+    "web_server": {
+        "password_login": false
+    }
+}
+```
+
 ### OpenID Connect
 Optional app-native OpenID Connect login. Omit `oidc` to disable it.
 

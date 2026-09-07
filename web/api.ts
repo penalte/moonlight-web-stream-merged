@@ -57,7 +57,7 @@ export async function tryLogin(): Promise<Api | null> {
     const prompt = new ApiUserPasswordPrompt(metadata?.oidc ? {
         displayLabel: metadata.oidc.display_label,
         loginUrl: metadata.oidc.login_url,
-    } : undefined)
+    } : undefined, metadata?.password_login ?? true)
     const userAuth = await showModal(prompt)
 
     if (userAuth == null) {

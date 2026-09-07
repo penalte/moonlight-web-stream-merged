@@ -225,6 +225,9 @@ pub struct WebServerConfig {
     pub session_cookie_secure: bool,
     #[serde(default = "default_session_cookie_expiration")]
     pub session_cookie_expiration: Duration,
+    /// Allow username+password sign in. Disable to make OIDC the only path.
+    #[serde(default = "default_password_login")]
+    pub password_login: bool,
     pub first_login_create_admin: bool,
     pub first_login_assign_global_hosts: bool,
     pub forwarded_header: Option<ForwardedHeaders>,
@@ -246,6 +249,7 @@ impl Default for WebServerConfig {
             url_path_prefix: "".to_string(),
             session_cookie_secure: default_session_cookie_secure(),
             session_cookie_expiration: default_session_cookie_expiration(),
+            password_login: default_password_login(),
             first_login_create_admin: true,
             first_login_assign_global_hosts: true,
             forwarded_header: None,
@@ -438,4 +442,8 @@ fn default_turn_rest_ttl() -> u64 {
 }
 fn default_turn_rest_username() -> String {
     "moonlight".to_string()
+}
+
+fn default_password_login() -> bool {
+    true
 }
