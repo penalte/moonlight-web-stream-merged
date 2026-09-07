@@ -8,6 +8,16 @@ import { IControlStream } from "./transport/index"
 
 // Normal scrolling multiplier
 const TOUCH_SCROLL_MULTIPLIER = 1
+// A WheelEvent reports deltas in one of three units (DOM_DELTA_PIXEL / _LINE /
+// _PAGE) and browsers disagree on the size of a notch: Chromium reports about
+// 100 pixels, Firefox about 3 lines. Moonlight follows the Windows WHEEL_DELTA
+// convention where 120 units is one notch, so raw deltas have to be normalised
+// to pixels first and then scaled, otherwise a notch arrives as ~100 or ~3
+// units instead of 120 and scrolling crawls.
+const WHEEL_PIXELS_PER_NOTCH = 100
+const WHEEL_PIXELS_PER_LINE = WHEEL_PIXELS_PER_NOTCH / 3
+const WHEEL_PIXELS_PER_PAGE = 800
+const WHEEL_UNITS_PER_NOTCH = 120
 // Distance until a touch cannot be a click anymore
 const TOUCH_AS_CLICK_MAX_DISTANCE = 2
 // Time till it's registered as a click, else it might be scrolling
@@ -264,7 +274,13 @@ export class StreamInput {
         }
     }
     onMouseWheel(event: WheelEvent) {
-        this.sendAccumulatedScroll(event.deltaX, -event.deltaY)
+        const pixelsPerUnit =
+            event.deltaMode == WheelEvent.DOM_DELTA_LINE ? WHEEL_PIXELS_PER_LINE :
+            event.deltaMode == WheelEvent.DOM_DELTA_PAGE ? WHEEL_PIXELS_PER_PAGE :
+            1
+        const scale = pixelsPerUnit * (WHEEL_UNITS_PER_NOTCH / WHEEL_PIXELS_PER_NOTCH)
+
+        this.sendAccumulatedScroll(event.deltaX * scale, -event.deltaY * scale)
     }
 
     sendMouseMove(movementX: number, movementY: number) {
