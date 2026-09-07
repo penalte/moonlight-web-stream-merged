@@ -375,6 +375,8 @@ mod tests {
             username_claim: "sub".to_string(),
             auto_create_missing_user: true,
             display_label: "Company SSO".to_string(),
+            groups_claim: "groups".to_string(),
+            admin_group: None,
         };
 
         let json = serde_json::to_string(&oidc).expect("oidc config should serialize");

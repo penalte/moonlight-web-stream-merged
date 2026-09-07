@@ -521,6 +521,8 @@ mod tests {
             username_claim: "preferred_username".to_string(),
             auto_create_missing_user: false,
             display_label: "SSO".to_string(),
+            groups_claim: "groups".to_string(),
+            admin_group: None,
         };
         let pending = PendingOidcLogins::default();
         let start = pending
@@ -689,6 +691,8 @@ mod tests {
             username_claim: "sub".to_string(),
             auto_create_missing_user: false,
             display_label: "SSO".to_string(),
+            groups_claim: "groups".to_string(),
+            admin_group: None,
         };
         let valid_pending = PendingOidcLogin {
             nonce: "expected-nonce".to_string(),
@@ -880,6 +884,8 @@ mod tests {
             username_claim: "preferred_username".to_string(),
             auto_create_missing_user: false,
             display_label: "SSO".to_string(),
+            groups_claim: "groups".to_string(),
+            admin_group: None,
         });
 
         validate_oidc_startup_config(&config).expect("secure config should validate");

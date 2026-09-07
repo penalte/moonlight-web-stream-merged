@@ -910,6 +910,8 @@ mod tests {
             username_claim: "preferred_username".to_string(),
             auto_create_missing_user,
             display_label: "OpenID Connect".to_string(),
+            groups_claim: "groups".to_string(),
+            admin_group: None,
         });
         config
     }

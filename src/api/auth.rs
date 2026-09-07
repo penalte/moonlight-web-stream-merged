@@ -460,6 +460,8 @@ mod tests {
             username_claim: "preferred_username".to_string(),
             auto_create_missing_user: false,
             display_label: "Company SSO".to_string(),
+            groups_claim: "groups".to_string(),
+            admin_group: None,
         }
     }
 
