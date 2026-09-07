@@ -106,6 +106,31 @@ test("codec detection uses the receiving video codec rather than assuming H264",
     assert.equal(await transport.findOutCodec(), "h265")
 })
 
+test("codec resolves before any media arrives, without polling statistics", async () => {
+    const { WebRTCTransport } = setup()
+    let statsCalls = 0
+    const transport = Object.assign(Object.create(WebRTCTransport.prototype), {
+        videoReceiver: { getParameters: () => ({ codecs: [{ mimeType: "video/H265" }] }) },
+        peer: { async getStats() { statsCalls++; return new Map() } },
+    })
+    // inbound-rtp cannot exist yet: RTP only flows after this resolves and the
+    // stream starts. Waiting on statistics here deadlocks every session.
+    assert.equal(await transport.findOutCodec(), "h265")
+    assert.equal(statsCalls, 0)
+})
+
+test("codec falls back to the answer SDP when the receiver reports no codecs", async () => {
+    const { WebRTCTransport } = setup()
+    const transport = Object.assign(Object.create(WebRTCTransport.prototype), {
+        videoReceiver: { getParameters: () => ({ codecs: [] }) },
+        peer: {
+            remoteDescription: { sdp: "a=rtpmap:98 H265/90000" },
+            async getStats() { return new Map() },
+        },
+    })
+    assert.equal(await transport.findOutCodec(), "h265")
+})
+
 
 test("a persistent disconnected peer fails with a specific reason", async () => {
     const { WebRTCTransport, tick } = setup()

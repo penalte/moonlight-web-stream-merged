@@ -283,6 +283,7 @@ export class WebRTCTransport implements Transport {
             track.contentHint = "motion"
 
             this.videoStream = track
+            this.videoReceiver = event.receiver
         } else if (track.kind == "audio") {
             this.audioStream = track
         }
@@ -290,6 +291,7 @@ export class WebRTCTransport implements Transport {
 
     // Video
     private videoStream: MediaStreamTrack | null = null
+    private videoReceiver: RTCRtpReceiver | null = null
 
     setVideoPipeline(type: "videotrack", pipeline: (TrackVideoRenderer & VideoRenderer)): Promise<void>;
     setVideoPipeline(type: "data", pipeline: (DataPipe & VideoRenderer)): Promise<void>;
@@ -353,29 +355,71 @@ export class WebRTCTransport implements Transport {
         }
     }
 
-    private async findOutCodec(): Promise<keyof VideoFormats> {
-        let tries = 0
+    private codecFromMimeType(mimeType: string | undefined): keyof VideoFormats | null {
+        switch (mimeType?.toLowerCase()) {
+            case "video/h264": return "h264"
+            case "video/h265": return "h265"
+            case "video/av1": return "av1Main8"
+            default: return null
+        }
+    }
 
-        while (true) {
+    private codecFromSdp(sdp: string | undefined): keyof VideoFormats | null {
+        // "a=rtpmap:98 H265/90000" -> "h265". Parsed by hand rather than with a
+        // regex: the test harness rewrites this source before evaluating it, and
+        // escaped regex literals do not survive that intact.
+        for (const rawLine of (sdp ?? "").split("\n")) {
+            const line = rawLine.trim()
+            if (!line.startsWith("a=rtpmap:")) {
+                continue
+            }
+            const name = line.split(" ")[1]?.split("/")[0]
+            const codec = name ? this.codecFromMimeType(`video/${name}`) : null
+            if (codec) {
+                return codec
+            }
+        }
+        return null
+    }
+
+    private async findOutCodec(): Promise<keyof VideoFormats> {
+        // Do NOT wait on receiver statistics here. inbound-rtp only exists once
+        // RTP arrives, and RTP cannot arrive until this resolves and the stream
+        // starts -- polling stats first deadlocks and then fails every session.
+        // Negotiated parameters and the answer SDP are both available as soon as
+        // the transceiver is set up, with no media required.
+        const negotiated = this.videoReceiver?.getParameters?.().codecs ?? []
+        for (const { mimeType } of negotiated) {
+            const codec = this.codecFromMimeType(mimeType)
+            if (codec) {
+                return codec
+            }
+        }
+
+        const fromSdp = this.codecFromSdp(this.peer.remoteDescription?.sdp)
+        if (fromSdp) {
+            return fromSdp
+        }
+
+        // Only reachable if media is already flowing, e.g. after a renegotiation.
+        for (let tries = 0; tries < 10; tries++) {
             const stats = await this.peer.getStats()
             for (const [_key, value] of stats) {
-                // Video Stream
                 if ("type" in value && "kind" in value
                     && value.type == "inbound-rtp" && value.kind == "video"
                 ) {
-                    const codec = stats.get(value.codecId)?.mimeType?.toLowerCase()
-                    if (codec == "video/h264") return "h264"
-                    if (codec == "video/h265") return "h265"
-                    if (codec == "video/av1") return "av1Main8"
+                    const codec = this.codecFromMimeType(stats.get(value.codecId)?.mimeType)
+                    if (codec) {
+                        return codec
+                    }
                 }
             }
-            tries += 1
-            if (tries > 10) {
-                throw new Error("No negotiated video codec appeared in WebRTC receiver statistics")
-            }
-
             await wait(100)
         }
+
+        throw new Error(
+            `Could not determine the negotiated video codec (receiver offered ${negotiated.length} codecs)`
+        )
     }
 
     private lastTotalDecodeTime = 0
