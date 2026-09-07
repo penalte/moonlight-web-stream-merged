@@ -210,13 +210,15 @@ mod tests {
 
     #[actix_web::test]
     async fn patch_role_applies_promotions_and_demotions() {
-        let mut config = Config::default();
-        config.data_storage = StorageConfig::Json {
-            path: std::env::temp_dir()
-                .join(format!("moonlight-role-test-{}.json", uuid::Uuid::new_v4()))
-                .display()
-                .to_string(),
-            session_expiration_check_interval: Duration::from_secs(3600),
+        let config = Config {
+            data_storage: StorageConfig::Json {
+                path: std::env::temp_dir()
+                    .join(format!("moonlight-role-test-{}.json", uuid::Uuid::new_v4()))
+                    .display()
+                    .to_string(),
+                session_expiration_check_interval: Duration::from_secs(3600),
+            },
+            ..Default::default()
         };
         let app = Data::new(App::new(config).await.unwrap());
         let user = app

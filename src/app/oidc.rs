@@ -411,6 +411,57 @@ fn random_urlsafe() -> Result<String, RustCryptoError> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// True when `groups_claim` in the ID token contains `admin_group`.
+///
+/// Accepts either an array of strings (the usual shape, and what pocket-id
+/// emits) or a single string, since providers differ. A missing or malformed
+/// claim means "not an admin" rather than an error: losing the claim should
+/// demote, never break the login.
+pub fn is_admin_from_claims(claims: &Value, groups_claim: &str, admin_group: &str) -> bool {
+    let Some(value) = claims.get(groups_claim) else {
+        return false;
+    };
+    match value {
+        Value::Array(groups) => groups
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|group| group == admin_group),
+        Value::String(group) => group == admin_group,
+        _ => false,
+    }
+}
+
+/// Adds the id token's non-standard claims back into `claims`.
+///
+/// openidconnect models the id token as `IdTokenClaims<AdditionalClaims, _>`
+/// and flattens anything it does not recognise into the additional-claims
+/// type. The core aliases use `EmptyAdditionalClaims`, so provider-specific
+/// entries such as `groups` are dropped when the typed claims are serialised,
+/// while standard ones like `preferred_username` survive.
+///
+/// Rather than re-parameterise every client type, this re-reads the payload of
+/// the token whose signature, audience and nonce were verified immediately
+/// above, so the extra entries carry the same trust as the typed ones. Existing
+/// keys are never overwritten: the verified typed claims win on conflict.
+fn merge_raw_id_token_claims(id_token: &CoreIdToken, mut claims: Value) -> Value {
+    let token = id_token.to_string();
+    let Some(payload) = token.split('.').nth(1) else {
+        return claims;
+    };
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload) else {
+        return claims;
+    };
+    let Ok(Value::Object(raw)) = serde_json::from_slice::<Value>(&bytes) else {
+        return claims;
+    };
+    if let Value::Object(map) = &mut claims {
+        for (key, value) in raw {
+            map.entry(key).or_insert(value);
+        }
+    }
+    claims
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -935,55 +986,4 @@ mod tests {
             .issuer_url = "http://127.0.0.1:8080/realms/moonlight".to_string();
         validate_oidc_startup_config(&config).expect("loopback HTTP issuer should be allowed");
     }
-}
-
-/// True when `groups_claim` in the ID token contains `admin_group`.
-///
-/// Accepts either an array of strings (the usual shape, and what pocket-id
-/// emits) or a single string, since providers differ. A missing or malformed
-/// claim means "not an admin" rather than an error: losing the claim should
-/// demote, never break the login.
-pub fn is_admin_from_claims(claims: &Value, groups_claim: &str, admin_group: &str) -> bool {
-    let Some(value) = claims.get(groups_claim) else {
-        return false;
-    };
-    match value {
-        Value::Array(groups) => groups
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|group| group == admin_group),
-        Value::String(group) => group == admin_group,
-        _ => false,
-    }
-}
-
-/// Adds the id token's non-standard claims back into `claims`.
-///
-/// openidconnect models the id token as `IdTokenClaims<AdditionalClaims, _>`
-/// and flattens anything it does not recognise into the additional-claims
-/// type. The core aliases use `EmptyAdditionalClaims`, so provider-specific
-/// entries such as `groups` are dropped when the typed claims are serialised,
-/// while standard ones like `preferred_username` survive.
-///
-/// Rather than re-parameterise every client type, this re-reads the payload of
-/// the token whose signature, audience and nonce were verified immediately
-/// above, so the extra entries carry the same trust as the typed ones. Existing
-/// keys are never overwritten: the verified typed claims win on conflict.
-fn merge_raw_id_token_claims(id_token: &CoreIdToken, mut claims: Value) -> Value {
-    let token = id_token.to_string();
-    let Some(payload) = token.split('.').nth(1) else {
-        return claims;
-    };
-    let Ok(bytes) = URL_SAFE_NO_PAD.decode(payload) else {
-        return claims;
-    };
-    let Ok(Value::Object(raw)) = serde_json::from_slice::<Value>(&bytes) else {
-        return claims;
-    };
-    if let Value::Object(map) = &mut claims {
-        for (key, value) in raw {
-            map.entry(key).or_insert(value);
-        }
-    }
-    claims
 }

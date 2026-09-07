@@ -76,10 +76,10 @@ pub async fn resolve_stream_address(
     }
 
     let configured_address = config.address.clone();
-    let mut resolved = lookup_host((configured_address.as_str(), 0)).await?;
+    let resolved = lookup_host((configured_address.as_str(), 0)).await?;
     let mut fallback = None;
 
-    while let Some(address) = resolved.next() {
+    for address in resolved {
         if address.is_ipv4() {
             config.address = address.ip().to_string();
             return Ok(config);
