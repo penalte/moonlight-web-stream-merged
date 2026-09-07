@@ -6,7 +6,7 @@
 # Context is the repository root, not ./docker.
 
 # ---------- builder ----------
-FROM rust:1.96-bookworm AS builder
+FROM rust:1.96.1-bookworm AS builder
 
 # moonlight-common-c is a C library pulled in via the moonlight-common git
 # dependency, so the C toolchain has to be present for the cargo build.
@@ -37,7 +37,7 @@ RUN curl -L --proto '=https' --tlsv1.2 -sSf \
 
 WORKDIR /build
 
-# rust-toolchain.toml pins 1.96.0 and the wasm32 target; install the toolchain
+# rust-toolchain.toml pins 1.96.1 and the wasm32 target; install the toolchain
 # before the source is copied so this layer caches across source changes.
 COPY rust-toolchain.toml ./
 RUN rustup show && rustup target add wasm32-unknown-unknown

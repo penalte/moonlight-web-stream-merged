@@ -48,6 +48,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 26
+          cache: npm
+      - name: Web regression tests
+        run: npm ci && npm run test:web
+
   build:
     needs: test
     strategy:
@@ -91,7 +98,7 @@ jobs:
     - name: Install Cross
       run: cargo binstall --force cross
     - name: Install Wasm-Bindgen
-      run: cargo binstall --force wasm-bindgen-cli
+      run: cargo binstall --force --no-confirm wasm-bindgen-cli --version 0.2.122
   
     # Build
     - name: Build

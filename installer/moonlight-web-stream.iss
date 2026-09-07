@@ -34,12 +34,54 @@ CloseApplications=no
 Source: "{#SourceDir}\web-server.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourceDir}\static\*"; DestDir: "{app}\static"; Flags: ignoreversion recursesubdirs createallsubdirs
 
+[Dirs]
+Name: "{app}\server"; Flags: uninsneveruninstall
+
 [Code]
 const
   ServiceRegistryKey = 'SYSTEM\CurrentControlSet\Services\{#ServiceName}';
 
 var
   WebUiPortPage: TInputQueryWizardPage;
+
+type
+  TServiceStatus = record
+    ServiceType, CurrentState, ControlsAccepted, Win32ExitCode,
+    ServiceSpecificExitCode, CheckPoint, WaitHint: LongWord;
+  end;
+
+function OpenSCManager(MachineName, DatabaseName: Integer; Access: LongWord): LongWord;
+  external 'OpenSCManagerW@advapi32.dll stdcall';
+function OpenService(Manager: LongWord; Name: String; Access: LongWord): LongWord;
+  external 'OpenServiceW@advapi32.dll stdcall';
+function QueryServiceStatus(Service: LongWord; var Status: TServiceStatus): Boolean;
+  external 'QueryServiceStatus@advapi32.dll stdcall';
+function CloseServiceHandle(Handle: LongWord): Boolean;
+  external 'CloseServiceHandle@advapi32.dll stdcall';
+
+function WaitForServiceStop(): Boolean;
+var
+  Manager, Service: LongWord;
+  Status: TServiceStatus;
+  Attempt: Integer;
+begin
+  Result := False;
+  Manager := OpenSCManager(0, 0, 1);
+  if Manager = 0 then exit;
+  Service := OpenService(Manager, '{#ServiceName}', 4);
+  if Service <> 0 then begin
+    for Attempt := 1 to 120 do begin
+      if not QueryServiceStatus(Service, Status) then break;
+      if Status.CurrentState = 1 then begin
+        Result := True;
+        break;
+      end;
+      Sleep(250);
+    end;
+    CloseServiceHandle(Service);
+  end;
+  CloseServiceHandle(Manager);
+end;
 
 procedure ExecSc(const Parameters: String; var ResultCode: Integer);
 begin
@@ -72,7 +114,7 @@ begin
     exit;
 
   ExecSc('stop "{#ServiceName}"', ResultCode);
-  Sleep(1500);
+  if WaitForServiceStop() then exit;
   { A damaged or older service binary can ignore SCM stop. Limit the fallback to this service. }
   ExecTaskkill('/f /fi "SERVICES eq {#ServiceName}"', ResultCode);
   Sleep(500);

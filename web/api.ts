@@ -191,6 +191,7 @@ class StreamedJsonResponse<Initial, Other> {
     private reader
     private decoder = new TextDecoder()
     private bufferedText = ""
+    private done = false
 
     constructor(body: ReadableStreamDefaultReader, response: Initial) {
         this.reader = body
@@ -199,14 +200,6 @@ class StreamedJsonResponse<Initial, Other> {
 
     async next(): Promise<Other | null> {
         while (true) {
-            const { done, value } = await this.reader.read()
-
-            if (done) {
-                return null
-            }
-
-            this.bufferedText += this.decoder.decode(value)
-
             const newlineIndex = this.bufferedText.indexOf("\n")
             if (newlineIndex >= 0) {
                 const text = this.bufferedText.slice(0, newlineIndex)
@@ -215,6 +208,17 @@ class StreamedJsonResponse<Initial, Other> {
 
                 return json
             }
+            if (this.done) {
+                const text = this.bufferedText
+                this.bufferedText = ""
+                return text.trim() ? JSON.parse(text) : null
+            }
+
+            const { done, value } = await this.reader.read()
+            this.done = done
+            this.bufferedText += done
+                ? this.decoder.decode()
+                : this.decoder.decode(value, { stream: true })
         }
     }
 }

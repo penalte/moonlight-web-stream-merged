@@ -1,6 +1,6 @@
 import { Api, fetchApi, WebRTCAnswer } from "../../api"
 import { StreamKeys } from "../../api_bindings"
-import { ActiveGamepads, ClientInputEvent, ClientInputEvent_Tags, ControlPacket, ControlPacketConfig, controlPacketDeserialize, controlPacketSerialize, KeyAction, KeyModifiers, keyStatesCanStore, keyStatesEmpty, keyStatesSetPressed, MouseButton, MouseButtonAction, PacketDirection, VideoFormats, WebRtcSessionAnswer, webrtcSessionAnswerParse, WebRtcSessionOffer, webrtcSessionOfferApply } from "../../uniffi/moonlight_common_bindings"
+import { InputBatcher, ClientInputEvent, ClientInputEvent_Tags, ControlPacket, ControlPacketConfig, controlPacketDeserialize, controlPacketSerialize, KeyAction, KeyModifiers, keyStatesCanStore, keyStatesEmpty, keyStatesSetPressed, MouseButton, MouseButtonAction, PacketDirection, VideoFormats, WebRtcSessionAnswer, webrtcSessionAnswerParse, WebRtcSessionOffer, webrtcSessionOfferApply } from "../../uniffi/moonlight_common_bindings"
 import { globalObject, wait } from "../../util"
 import { AudioPlayer, TrackAudioPlayer } from "../audio/index"
 import { U16_MAX } from "../buffer"
@@ -100,6 +100,7 @@ export class WebRTCTransport implements Transport {
             type: "answer",
             sdp: response.answerSdp,
         })
+        await this.sendIceCandidates()
     }
 
     private connectData: TransportConnectData | null = null
@@ -164,6 +165,8 @@ export class WebRTCTransport implements Transport {
     // -- Trickle Ice
     private iceCandidateSendTimer: number | null = null
     private pendingIceCandidates: Array<string> = []
+    private sendingIceCandidates = false
+    private closed = false
     private onIceCandidate(event: RTCPeerConnectionIceEvent) {
         if (!event.candidate) {
             // Ice Gathering finished
@@ -174,34 +177,38 @@ export class WebRTCTransport implements Transport {
         const candidate = event.candidate.toJSON().candidate
         if (candidate) {
             this.pendingIceCandidates.push(candidate)
+            void this.sendIceCandidates()
         }
     }
 
     private boundSendIceCandidates = this.sendIceCandidates.bind(this)
     private async sendIceCandidates() {
-        this.iceCandidateSendTimer = null
+        if (this.closed || this.sendingIceCandidates || !this.location) {
+            return
+        }
         if (this.iceCandidateSendTimer != null) {
             globalObject().clearTimeout(this.iceCandidateSendTimer)
+            this.iceCandidateSendTimer = null
         }
-
-        for (const candidate of this.pendingIceCandidates) {
-            this.logger?.debug(`sending ice candidate: ${candidate}`)
+        if (this.pendingIceCandidates.length == 0) {
+            return
         }
-
-        if (this.location && this.pendingIceCandidates.length > 0) {
-            const trickleIceSdpFrag = this.pendingIceCandidates.map(x => `a=${x}`).join("\r\n")
-
+        this.sendingIceCandidates = true
+        const candidates = this.pendingIceCandidates.splice(0)
+        try {
             await fetchApi(this.api, this.location, "PATCH", {
                 noUrlModify: true,
-                trickleIceSdpFrag,
+                trickleIceSdpFrag: candidates.map(x => "a=" + x).join("\r\n"),
                 response: "ignore",
             })
-
-            this.pendingIceCandidates = []
-        }
-
-        if (this.peer.iceGatheringState != "complete") {
-            this.iceCandidateSendTimer = globalObject().setTimeout(this.boundSendIceCandidates, 2000)
+        } catch (error) {
+            this.pendingIceCandidates.unshift(...candidates)
+            this.logger?.debug("failed to send ice candidates: " + error)
+        } finally {
+            this.sendingIceCandidates = false
+            if (!this.closed && this.pendingIceCandidates.length > 0) {
+                this.iceCandidateSendTimer = globalObject().setTimeout(this.boundSendIceCandidates, 200)
+            }
         }
     }
 
@@ -275,6 +282,9 @@ export class WebRTCTransport implements Transport {
     }
 
     async close(): Promise<void> {
+        if (this.closed) return
+        this.closed = true
+        this.controlStream.close()
         // Close the peer
         this.peer.close()
 
@@ -397,7 +407,8 @@ class WebRtcControlStream implements IControlStream {
     private currentPressedKeys: Set<number> = new Set()
     private keyStatesSequenceNumber = 0
 
-    private controllerStates: Array<typeof ControlPacket.ControllerState | null> = new Array(16)
+    private controllerBatcher = new InputBatcher()
+    private disposed = false
 
     // Buffering
     private packetBuffer: Array<ControlPacket> = []
@@ -405,7 +416,6 @@ class WebRtcControlStream implements IControlStream {
     constructor(peer: RTCPeerConnection, logger?: Logger) {
         this.logger = logger
 
-        this.controllerStates.fill(null)
 
         this.mouseAbsolute = peer.createDataChannel("moonlight.control.mouseAbsolute", {
             ordered: false,
@@ -562,44 +572,11 @@ class WebRtcControlStream implements IControlStream {
                 this.sendKeysCompact()
                 break
             case ClientInputEvent_Tags.ControllerConnect:
-                let controllerNumber = input.inner.controllerNumber % 16
-
-                this.controllerStates[controllerNumber]
-
-                this.sendRaw(new ControlPacket.ControllerArrival({
-                    controllerNumber,
-                    ty: input.inner.ty,
-                    supportedButtons: input.inner.supportedButtons,
-                    capabilities: input.inner.capabilities,
-                }))
-                break
             case ClientInputEvent_Tags.ControllerState:
-                controllerNumber = input.inner.controllerNumber % 16
-
-                throw "TODO"
-
-                break
             case ClientInputEvent_Tags.ControllerDisconnect:
-                controllerNumber = input.inner.controllerNumber % 16
-
-                this.controllerStates[controllerNumber] = null
-
-                this.sendRaw(new ControlPacket.ControllerState({
-                    controllerNumber,
-                    activeGamepadMask: this.getControllerMask(),
-                    buttonFlags: 0,
-                    buttonFlags2: 0,
-                    headerB: 0,
-                    leftStickX: 0,
-                    leftStickY: 0,
-                    leftTrigger: 0,
-                    midB: 0,
-                    rightStickX: 0,
-                    rightStickY: 0,
-                    rightTrigger: 0,
-                    tailA: 0,
-                    tailB: 0,
-                }))
+                for (const packet of this.controllerBatcher.batchInput(input)) {
+                    this.sendRaw(packet)
+                }
                 break
             case ClientInputEvent_Tags.Touch:
                 break
@@ -630,9 +607,14 @@ class WebRtcControlStream implements IControlStream {
         }
     }
 
+    close() {
+        this.disposed = true
+        this.setChannel(null)
+    }
+
     private boundSendBatchedInputs = this.sendBatchedInputs.bind(this)
     private sendBatchedInputs() {
-        if (this.channel?.readyState == "closed") {
+        if (this.disposed || this.channel?.readyState == "closed") {
             return
         }
         globalObject().requestAnimationFrame(this.boundSendBatchedInputs)
@@ -751,19 +733,8 @@ class WebRtcControlStream implements IControlStream {
         this.keyStatesSequenceNumber += 1
     }
 
-    private getControllerMask(): ActiveGamepads {
-        const gamepads: Record<string, boolean> = {}
-
-        for (let i = 0; i < 16; i++) {
-            const exists = this.controllerStates[i] != null
-            gamepads[`gamepad${i + 1}`] = exists
-        }
-
-        return gamepads as ActiveGamepads
-    }
-
     private trySendOn(channel: RTCDataChannel, packet: ControlPacket) {
-        if (!this.config) {
+        if (!this.config || channel.readyState != "open") {
             return
         }
 

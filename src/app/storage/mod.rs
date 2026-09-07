@@ -180,13 +180,15 @@ pub enum Either<L, R> {
 
 #[async_trait]
 pub trait Storage {
+    /// Persist all changes made before this call returns.
+    async fn flush(&self) -> Result<(), AppError>;
     // -- Roles --
     async fn add_role(&self, role: StorageRoleAdd) -> Result<StorageRole, AppError>;
     async fn modify_role(&self, role_id: RoleId, host: StorageRoleModify) -> Result<(), AppError>;
     async fn get_role(&self, role_id: RoleId) -> Result<StorageRole, AppError>;
     /// Deletes a role.
     ///
-    /// All users that are in that role should also be delete.
+    /// Reject deletion while users still reference the role.
     async fn remove_role(&self, role_id: RoleId) -> Result<(), AppError>;
     /// The returned tuple can contain a Vec<RoleId> or Vec<StorageRole> if the Storage thinks it's more efficient to query all data directly
     async fn list_roles(&self) -> Result<Either<Vec<RoleId>, Vec<StorageRole>>, AppError>;
@@ -197,6 +199,8 @@ pub trait Storage {
     // -- Users --
     /// No duplicate names are allowed!
     async fn add_user(&self, user: StorageUserAdd) -> Result<StorageUser, AppError>;
+    /// Atomically insert only when no user exists.
+    async fn add_first_user(&self, user: StorageUserAdd) -> Result<StorageUser, AppError>;
     async fn modify_user(&self, user_id: UserId, user: StorageUserModify) -> Result<(), AppError>;
     async fn get_user(&self, user_id: UserId) -> Result<StorageUser, AppError>;
     /// The returned tuple can contain a StorageUser if the Storage thinks it's more efficient to query all data directly

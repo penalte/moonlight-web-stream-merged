@@ -23,7 +23,8 @@
   },
   "scripts": {
     "dev": "npm run prebuild && webpack --watch --mode=development",
-    "test:web": "node tests/oidc-login-order.test.mjs && node tests/json-stream-buffer.test.mjs",
+    "test:web": "node --test tests/*.test.mjs",
+    "test:smoke": "node tests/server-smoke.mjs",
     "build": "npm run prebuild && webpack --mode=production",
     "prebuild": "npm run generate-bindings && npm run build-moonlight-common",
     "generate-bindings": "cargo test export_bindings",

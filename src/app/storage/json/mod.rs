@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
-    io::ErrorKind,
+    io::{self, ErrorKind},
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Weak},
     time::{Duration, Instant},
 };
 
@@ -11,9 +11,11 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use moonlight_common::{crypto::rustcrypto::RustCryptoBackend, http::pair::PairingCryptoBackend};
 use tokio::{
-    fs, spawn,
+    fs,
+    io::AsyncWriteExt,
+    spawn,
     sync::{
-        RwLock,
+        Mutex, RwLock,
         mpsc::{self, Receiver, Sender, error::TrySendError},
         oneshot,
     },
@@ -46,6 +48,7 @@ mod versions;
 
 pub struct JsonStorage {
     file: PathBuf,
+    write_lock: Mutex<()>,
     store_sender: Sender<()>,
     session_expiration_checker: JoinHandle<()>,
     // IMPORTANT: only lock those mutexes in descending order to prevent deadlocks
@@ -70,13 +73,92 @@ struct Session {
 }
 
 impl JsonStorage {
+    async fn insert_user(
+        &self,
+        user: StorageUserAdd,
+        first_only: bool,
+    ) -> Result<StorageUser, AppError> {
+        let user = V3User {
+            role_id: user.role_id.0,
+            name: user.name,
+            password: user.password.map(|password| V2UserPassword {
+                salt: password.salt,
+                hash: password.hash,
+                iterations: password.iterations,
+            }),
+            client_unique_id: user.client_unique_id,
+            oidc_identity: user.oidc_identity.map(|identity| V3OidcIdentity {
+                issuer: identity.issuer,
+                subject: identity.subject,
+            }),
+        };
+
+        let mut users = self.users.write().await;
+        if first_only && !users.is_empty() {
+            return Err(AppError::FirstUserAlreadyExists);
+        }
+        let roles = self.roles.read().await;
+        if !roles.contains_key(&user.role_id) {
+            return Err(AppError::RoleNotFound);
+        }
+
+        // Enforce username and OIDC identity uniqueness while holding the users
+        // write lock so concurrent provisioning cannot pass a check-then-insert race.
+        for existing in users.values() {
+            let existing = existing.read().await;
+            let duplicate_name = existing.name == user.name;
+            let duplicate_oidc_identity = user.oidc_identity.as_ref().is_some_and(|identity| {
+                existing
+                    .oidc_identity
+                    .as_ref()
+                    .is_some_and(|existing_identity| {
+                        existing_identity.issuer == identity.issuer
+                            && existing_identity.subject == identity.subject
+                    })
+            });
+            if duplicate_name || duplicate_oidc_identity {
+                return Err(AppError::UserAlreadyExists);
+            }
+        }
+
+        let mut id;
+        loop {
+            id = random_number()?;
+
+            if !users.contains_key(&id) {
+                break;
+            }
+        }
+        users.insert(id, RwLock::new(user.clone()));
+
+        drop(users);
+
+        self.force_write();
+
+        Ok(StorageUser {
+            id: UserId(id),
+            name: user.name,
+            password: user.password.map(|password| StoragePassword {
+                salt: password.salt,
+                hash: password.hash,
+                iterations: password.iterations,
+            }),
+            role_id: RoleId(user.role_id),
+            client_unique_id: user.client_unique_id,
+            oidc_identity: user.oidc_identity.map(|identity| StorageOidcIdentity {
+                issuer: identity.issuer,
+                subject: identity.subject,
+            }),
+        })
+    }
+
     pub async fn load(
         file: PathBuf,
         session_expiration_check_interval: Duration,
     ) -> Result<Arc<Self>, anyhow::Error> {
         let (store_sender, store_receiver) = mpsc::channel(1);
 
-        let (this_sender, this_receiver) = oneshot::channel::<Arc<Self>>();
+        let (this_sender, this_receiver) = oneshot::channel::<Weak<Self>>();
 
         let session_expiration_checker = spawn(async move {
             let this = match this_receiver.await {
@@ -91,6 +173,9 @@ impl JsonStorage {
 
             loop {
                 sleep(session_expiration_check_interval).await;
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
                 debug!("Clearing all expired sessions!");
 
                 let mut sessions = this.sessions.write().await;
@@ -106,6 +191,7 @@ impl JsonStorage {
 
         let this = Self {
             file,
+            write_lock: Mutex::new(()),
             store_sender,
             session_expiration_checker,
             hosts: Default::default(),
@@ -117,7 +203,7 @@ impl JsonStorage {
         };
         let this = Arc::new(this);
 
-        if this_sender.send(this.clone()).is_err() {
+        if this_sender.send(Arc::downgrade(&this)).is_err() {
             error!(
                 "Failed to send values to session expiration checker. All sessions will last forever!"
             );
@@ -126,7 +212,7 @@ impl JsonStorage {
         this.load_internal().await?;
 
         spawn({
-            let this = this.clone();
+            let this = Arc::downgrade(&this);
 
             async move { file_writer(store_receiver, this).await }
         });
@@ -195,7 +281,8 @@ impl JsonStorage {
 
         Ok(())
     }
-    async fn store(&self) {
+    async fn store(&self) -> io::Result<()> {
+        let _write = self.write_lock.lock().await;
         let json = {
             let users = self.users.read().await;
             let hosts = self.hosts.read().await;
@@ -233,32 +320,44 @@ impl JsonStorage {
             })
         };
 
-        let text = match serde_json::to_string_pretty(&json) {
-            Ok(text) => text,
-            Err(err) => {
-                error!("Failed to serialize data to json: {err:?}");
-                return;
-            }
-        };
-
-        if let Some(parent) = self.file.parent()
-            && let Err(err) = fs::create_dir_all(parent).await
-        {
-            error!(error = %err, "Failed to create directory for data");
-        }
-        if let Err(err) = fs::write(&self.file, text).await {
-            error!(error = %err, "Failed to write data to file");
-        }
+        let text = serde_json::to_vec_pretty(&json).map_err(io::Error::other)?;
+        let parent = self
+            .file
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        fs::create_dir_all(parent).await?;
+        // The writer lock covers snapshot creation and replacement, so an older
+        // queued save cannot overwrite a newer flush. Keep the temp on this volume.
+        let temporary = self.file.with_extension("json.tmp");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)
+            .await?;
+        file.write_all(&text).await?;
+        file.sync_all().await?;
+        drop(file);
+        fs::rename(&temporary, &self.file).await?;
+        #[cfg(unix)]
+        fs::File::open(parent).await?.sync_all().await?;
+        Ok(())
     }
 }
 
-async fn file_writer(mut store_receiver: Receiver<()>, json: Arc<JsonStorage>) {
+async fn file_writer(mut store_receiver: Receiver<()>, json: Weak<JsonStorage>) {
     loop {
         if store_receiver.recv().await.is_none() {
             return;
         }
 
-        json.store().await;
+        let Some(json) = json.upgrade() else {
+            return;
+        };
+        if let Err(err) = json.store().await {
+            error!(error = %err, "Failed to persist application data");
+        }
     }
 }
 
@@ -349,6 +448,9 @@ fn random_number() -> Result<u32, AppError> {
 
 #[async_trait]
 impl Storage for JsonStorage {
+    async fn flush(&self) -> Result<(), AppError> {
+        self.store().await.map_err(AppError::from)
+    }
     async fn add_role(&self, role: StorageRoleAdd) -> Result<StorageRole, AppError> {
         let role = V3Role {
             ty: match role.ty {
@@ -448,44 +550,23 @@ impl Storage for JsonStorage {
         Ok(role_from_json(role_id, &role))
     }
     async fn remove_role(&self, role_id: RoleId) -> Result<(), AppError> {
-        // Delete all users with that role
-        {
-            let mut users = self.users.write().await;
-
-            let mut users_to_remove = vec![];
-
-            // Find all users with that role
-            for (user_id, user) in users.iter() {
-                let user = user.read().await;
-
-                if user.role_id == role_id.0 {
-                    users_to_remove.push(*user_id);
-                }
-            }
-
-            // Remove all user id's in that list
-            for user_id in users_to_remove {
-                users.remove(&user_id);
+        let users = self.users.write().await;
+        let mut roles = self.roles.write().await;
+        if !roles.contains_key(&role_id.0) {
+            return Err(AppError::RoleNotFound);
+        }
+        for user in users.values() {
+            if user.read().await.role_id == role_id.0 {
+                return Err(AppError::RoleInUse);
             }
         }
-
-        // Delete that role
-        let result = {
-            let mut roles = self.roles.write().await;
-
-            let result = match roles.remove(&role_id.0) {
-                None => Err(AppError::RoleNotFound),
-                Some(_) => Ok(()),
-            };
-
-            drop(roles);
-
-            result
-        };
-
+        roles.remove(&role_id.0);
+        let mut default_role_id = self.default_role_id.write().await;
+        if *default_role_id == Some(role_id.0) {
+            *default_role_id = None;
+        }
         self.force_write();
-
-        result
+        Ok(())
     }
     async fn list_roles(&self) -> Result<Either<Vec<RoleId>, Vec<StorageRole>>, AppError> {
         let roles = self.roles.read().await;
@@ -507,6 +588,12 @@ impl Storage for JsonStorage {
         Ok(default_role_id.map(RoleId).map(Either::Left))
     }
     async fn set_default_role(&self, role_id: Option<RoleId>) -> Result<(), AppError> {
+        let roles = self.roles.read().await;
+        if let Some(role_id) = role_id
+            && !roles.contains_key(&role_id.0)
+        {
+            return Err(AppError::RoleNotFound);
+        }
         let mut default_role_id = self.default_role_id.write().await;
 
         *default_role_id = role_id.map(|x| x.0);
@@ -517,71 +604,10 @@ impl Storage for JsonStorage {
     }
 
     async fn add_user(&self, user: StorageUserAdd) -> Result<StorageUser, AppError> {
-        let user = V3User {
-            role_id: user.role_id.0,
-            name: user.name,
-            password: user.password.map(|password| V2UserPassword {
-                salt: password.salt,
-                hash: password.hash,
-                iterations: password.iterations,
-            }),
-            client_unique_id: user.client_unique_id,
-            oidc_identity: user.oidc_identity.map(|identity| V3OidcIdentity {
-                issuer: identity.issuer,
-                subject: identity.subject,
-            }),
-        };
-
-        let mut users = self.users.write().await;
-
-        // Enforce username and OIDC identity uniqueness while holding the users
-        // write lock so concurrent provisioning cannot pass a check-then-insert race.
-        for existing in users.values() {
-            let existing = existing.read().await;
-            let duplicate_name = existing.name == user.name;
-            let duplicate_oidc_identity = user.oidc_identity.as_ref().is_some_and(|identity| {
-                existing
-                    .oidc_identity
-                    .as_ref()
-                    .is_some_and(|existing_identity| {
-                        existing_identity.issuer == identity.issuer
-                            && existing_identity.subject == identity.subject
-                    })
-            });
-            if duplicate_name || duplicate_oidc_identity {
-                return Err(AppError::UserAlreadyExists);
-            }
-        }
-
-        let mut id;
-        loop {
-            id = random_number()?;
-
-            if !users.contains_key(&id) {
-                break;
-            }
-        }
-        users.insert(id, RwLock::new(user.clone()));
-
-        drop(users);
-
-        self.force_write();
-
-        Ok(StorageUser {
-            id: UserId(id),
-            name: user.name,
-            password: user.password.map(|password| StoragePassword {
-                salt: password.salt,
-                hash: password.hash,
-                iterations: password.iterations,
-            }),
-            role_id: RoleId(user.role_id),
-            client_unique_id: user.client_unique_id,
-            oidc_identity: user.oidc_identity.map(|identity| StorageOidcIdentity {
-                issuer: identity.issuer,
-                subject: identity.subject,
-            }),
-        })
+        self.insert_user(user, false).await
+    }
+    async fn add_first_user(&self, user: StorageUserAdd) -> Result<StorageUser, AppError> {
+        self.insert_user(user, true).await
     }
     async fn modify_user(
         &self,
@@ -591,9 +617,15 @@ impl Storage for JsonStorage {
         let users = self.users.read().await;
 
         let user_lock = users.get(&user_id.0).ok_or(AppError::UserNotFound)?;
+        if let Some(role_id) = modify.role_id
+            && !self.roles.read().await.contains_key(&role_id.0)
+        {
+            return Err(AppError::RoleNotFound);
+        }
         let mut user = user_lock.write().await;
 
         if let Some(password) = modify.password {
+            self.remove_all_user_session_tokens(user_id).await?;
             user.password = password.map(|password| V2UserPassword {
                 salt: password.salt,
                 hash: password.hash,
@@ -681,6 +713,11 @@ impl Storage for JsonStorage {
             Some(_) => Ok(()),
         };
 
+        self.remove_all_user_session_tokens(user_id).await?;
+        let mut default_user_id = self.default_user_id.write().await;
+        if *default_user_id == Some(user_id.0) {
+            *default_user_id = None;
+        }
         drop(users);
 
         self.force_write();
@@ -713,6 +750,12 @@ impl Storage for JsonStorage {
         Ok(default_user_id.map(UserId).map(Either::Left))
     }
     async fn set_default_user(&self, user_id: Option<UserId>) -> Result<(), AppError> {
+        let users = self.users.read().await;
+        if let Some(user_id) = user_id
+            && !users.contains_key(&user_id.0)
+        {
+            return Err(AppError::UserNotFound);
+        }
         let mut default_user_id = self.default_user_id.write().await;
 
         *default_user_id = user_id.map(|x| x.0);
@@ -727,6 +770,9 @@ impl Storage for JsonStorage {
         user_id: UserId,
         expiration: Duration,
     ) -> Result<SessionToken, AppError> {
+        let users = self.users.read().await;
+        let user = users.get(&user_id.0).ok_or(AppError::UserNotFound)?;
+        let _user = user.read().await;
         let mut token;
         {
             let sessions = self.sessions.read().await;
@@ -774,6 +820,7 @@ impl Storage for JsonStorage {
 
         sessions
             .get(&session)
+            .filter(|session| session.created_at.elapsed() < session.expiration)
             .map(|session| (UserId(session.user_id), None))
             .ok_or(AppError::SessionTokenNotFound)
     }
@@ -898,5 +945,178 @@ impl Storage for JsonStorage {
         }
 
         Ok(user_hosts)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod regression_tests {
+    use super::*;
+
+    async fn storage() -> Arc<JsonStorage> {
+        let file = std::env::temp_dir().join(format!(
+            "moonlight-storage-regression-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        JsonStorage::load(file, Duration::from_secs(3600))
+            .await
+            .unwrap()
+    }
+
+    async fn role(storage: &JsonStorage) -> RoleId {
+        storage
+            .add_role(StorageRoleAdd {
+                name: "Test".into(),
+                ty: RoleType::User,
+                default_settings: StorageRoleDefaultSettings::default(),
+                permissions: StorageRolePermissions::default(),
+            })
+            .await
+            .unwrap()
+            .id
+    }
+
+    fn user(role_id: RoleId, name: &str) -> StorageUserAdd {
+        StorageUserAdd {
+            role_id,
+            name: name.into(),
+            password: None,
+            client_unique_id: name.into(),
+            oidc_identity: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_bootstrap_creates_only_one_user() {
+        let storage = storage().await;
+        let role_id = role(&storage).await;
+        let (first, second) = tokio::join!(
+            storage.add_first_user(user(role_id, "first")),
+            storage.add_first_user(user(role_id, "second")),
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        assert!(
+            matches!(first, Err(AppError::FirstUserAlreadyExists))
+                || matches!(second, Err(AppError::FirstUserAlreadyExists))
+        );
+        assert_eq!(storage.users.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn changing_password_revokes_all_existing_sessions_only_for_that_user() {
+        let storage = storage().await;
+        let role_id = role(&storage).await;
+        let alice = storage.add_user(user(role_id, "alice")).await.unwrap();
+        let bob = storage.add_user(user(role_id, "bob")).await.unwrap();
+        let first = storage
+            .create_session_token(alice.id, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let second = storage
+            .create_session_token(alice.id, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let other = storage
+            .create_session_token(bob.id, Duration::from_secs(60))
+            .await
+            .unwrap();
+        storage
+            .modify_user(
+                alice.id,
+                StorageUserModify {
+                    password: Some(Some(StoragePassword {
+                        salt: [1; 16],
+                        hash: [2; 32],
+                        iterations: 600_000,
+                    })),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage.get_user_by_session_token(first).await,
+            Err(AppError::SessionTokenNotFound)
+        ));
+        assert!(matches!(
+            storage.get_user_by_session_token(second).await,
+            Err(AppError::SessionTokenNotFound)
+        ));
+        assert!(storage.get_user_by_session_token(other).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn expired_sessions_are_rejected_before_the_cleanup_task_runs() {
+        let storage = storage().await;
+        let id = storage
+            .add_user(user(role(&storage).await, "alice"))
+            .await
+            .unwrap()
+            .id;
+        let token = storage
+            .create_session_token(id, Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(storage.sessions.read().await.contains_key(&token));
+        assert!(matches!(
+            storage.get_user_by_session_token(token).await,
+            Err(AppError::SessionTokenNotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_populated_role_preserves_users_and_the_default() {
+        let storage = storage().await;
+        let role_id = role(&storage).await;
+        let id = storage.add_user(user(role_id, "alice")).await.unwrap().id;
+        storage.set_default_role(Some(role_id)).await.unwrap();
+        assert!(matches!(
+            storage.remove_role(role_id).await,
+            Err(AppError::RoleInUse)
+        ));
+        assert!(storage.get_user(id).await.is_ok());
+        assert!(storage.get_role(role_id).await.is_ok());
+        storage.remove_user(id).await.unwrap();
+        storage.remove_role(role_id).await.unwrap();
+        assert!(storage.default_role().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn deleted_users_lose_sessions_and_default_selection() {
+        let storage = storage().await;
+        let id = storage
+            .add_user(user(role(&storage).await, "alice"))
+            .await
+            .unwrap()
+            .id;
+        storage.set_default_user(Some(id)).await.unwrap();
+        let token = storage
+            .create_session_token(id, Duration::from_secs(60))
+            .await
+            .unwrap();
+        storage.remove_user(id).await.unwrap();
+        assert!(storage.default_user().await.unwrap().is_none());
+        assert!(storage.get_user_by_session_token(token).await.is_err());
+        assert!(
+            storage
+                .create_session_token(id, Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_persists_latest_state_and_replaces_an_existing_file() {
+        let storage = storage().await;
+        let role_id = role(&storage).await;
+        storage.flush().await.unwrap();
+        let id = storage.add_user(user(role_id, "alice")).await.unwrap().id;
+        storage.flush().await.unwrap();
+        let loaded = JsonStorage::load(storage.file.clone(), Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(loaded.get_user(id).await.unwrap().name, "alice");
+        let json = fs::read_to_string(&storage.file).await.unwrap();
+        assert!(serde_json::from_str::<Json>(&json).is_ok());
     }
 }

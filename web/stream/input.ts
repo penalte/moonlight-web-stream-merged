@@ -965,7 +965,7 @@ export class StreamInput {
         }
 
         // Reset rumble
-        this.gamepadRumbleCurrent[0] = { lowFrequencyMotor: 0, highFrequencyMotor: 0, leftTrigger: 0, rightTrigger: 0 }
+        this.gamepadRumbleCurrent[gamepad.index] = { lowFrequencyMotor: 0, highFrequencyMotor: 0, leftTrigger: 0, rightTrigger: 0 }
 
         let capabilities: ControllerCapabilities = {
             analogTriggers: false,
@@ -1001,7 +1001,7 @@ export class StreamInput {
             }
         }
 
-        this.sendControllerAdd(this.gamepads.length - 1, SUPPORTED_BUTTONS, capabilities)
+        this.sendControllerAdd(id, SUPPORTED_BUTTONS, capabilities)
 
         if (gamepad.mapping != "standard") {
             console.warn(`[Gamepad]: Unable to read values of gamepad with mapping ${gamepad.mapping}`)
@@ -1010,10 +1010,7 @@ export class StreamInput {
     onGamepadDisconnect(event: GamepadEvent) {
         const index = this.gamepads.findIndex(value => value?.gamepadIndex == event.gamepad.index)
         if (index != -1) {
-            const id = this.gamepads[index]?.gamepadIndex
-            if (id != null) {
-                this.sendControllerRemove(id)
-            }
+            this.sendControllerRemove(index)
 
             this.gamepads[index] = null
         }
@@ -1032,7 +1029,7 @@ export class StreamInput {
         for (let gamepadId = 0; gamepadId < this.gamepads.length; gamepadId++) {
             const oldGamepadState = this.gamepads[gamepadId]
             if (oldGamepadState == null) {
-                return
+                continue
             }
             const gamepad = navigator.getGamepads()[oldGamepadState.gamepadIndex]
             if (!gamepad) {

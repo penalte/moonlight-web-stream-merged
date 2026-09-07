@@ -103,7 +103,7 @@ pub async fn patch_role(
         &admin,
         StorageRoleModify {
             name: request.name,
-            ty: None,
+            ty: request.ty.map(Into::into),
             permissions: request
                 .permissions
                 .map(|permissions| StorageRolePermissions {
@@ -194,4 +194,83 @@ pub async fn get_default_role(
     let role = app.default_role().await?;
 
     Ok(Json(GetDefaultRoleResponse { id: role.id().0 }))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::{
+        api::api_service,
+        app::user::RoleType,
+        config::{Config, StorageConfig},
+    };
+    use actix_web::{App as ActixApp, http::StatusCode, test};
+    use std::time::Duration;
+
+    #[actix_web::test]
+    async fn patch_role_applies_promotions_and_demotions() {
+        let mut config = Config::default();
+        config.data_storage = StorageConfig::Json {
+            path: std::env::temp_dir()
+                .join(format!("moonlight-role-test-{}.json", uuid::Uuid::new_v4()))
+                .display()
+                .to_string(),
+            session_expiration_check_interval: Duration::from_secs(3600),
+        };
+        let app = Data::new(App::new(config).await.unwrap());
+        let user = app
+            .try_add_first_login("admin".into(), "test password".into())
+            .await
+            .unwrap();
+        let token = user.new_session(Duration::from_secs(60)).await.unwrap();
+        let mut bytes = [0; 64];
+        let authorization = format!("Bearer {}", token.encode(&mut bytes));
+        let admin = user.into_admin().await.unwrap();
+        let role = app
+            .add_role(
+                &admin,
+                StorageRoleAdd {
+                    name: "Editable".into(),
+                    ty: RoleType::User,
+                    default_settings: StorageRoleDefaultSettings::default(),
+                    permissions: StorageRolePermissions::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let service =
+            test::init_service(ActixApp::new().app_data(app.clone()).service(api_service())).await;
+        for (ty, expected) in [("Admin", RoleType::Admin), ("User", RoleType::User)] {
+            let request = test::TestRequest::patch()
+                .uri("/api/role")
+                .insert_header(("Authorization", authorization.clone()))
+                .set_json(serde_json::json!({ "id": role.id().0, "ty": ty }))
+                .to_request();
+            assert_eq!(
+                test::call_service(&service, request).await.status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                app.role_by_id(role.id()).await.unwrap().ty().await.unwrap(),
+                expected
+            );
+        }
+
+        // A patch that omits ty must leave the role type alone. Sending it as a
+        // required field would let any partial update silently demote a role.
+        let request = test::TestRequest::patch()
+            .uri("/api/role")
+            .insert_header(("Authorization", authorization.clone()))
+            .set_json(serde_json::json!({ "id": role.id().0, "name": "Renamed" }))
+            .to_request();
+        assert_eq!(
+            test::call_service(&service, request).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.role_by_id(role.id()).await.unwrap().ty().await.unwrap(),
+            RoleType::User
+        );
+    }
 }

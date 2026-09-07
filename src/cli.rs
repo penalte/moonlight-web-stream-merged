@@ -54,6 +54,7 @@ pub struct Cli {
 
     #[cfg_attr(windows, arg(long, hide = true))]
     #[cfg_attr(not(windows), arg(skip))]
+    #[allow(dead_code)] // Service dispatch reads the flag before initializing Clap.
     pub service: bool,
 
     #[command(flatten)]

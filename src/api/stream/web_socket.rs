@@ -32,8 +32,11 @@ use moonlight_common::{
 };
 use tokio::{
     select,
-    sync::mpsc::{UnboundedSender, unbounded_channel},
-    time::{interval, sleep},
+    sync::{
+        OwnedSemaphorePermit, Semaphore,
+        mpsc::{Sender, channel},
+    },
+    time::{interval, sleep, timeout},
 };
 use tracing::{Instrument, debug, debug_span, error, info, instrument, trace, warn};
 
@@ -41,6 +44,21 @@ use crate::{
     api::stream::create_control_packet_config,
     app::{AppError, host::HostId, user::AuthenticatedUser},
 };
+
+// Bound both the number and maximum size of queued frames per client.
+const WS_QUEUE_CAPACITY: usize = 256;
+const WS_MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const WS_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct QueuedWsData {
+    data: WsData,
+    _permit: OwnedSemaphorePermit,
+}
+
+struct WsQueue {
+    sender: Sender<QueuedWsData>,
+    budget: Arc<Semaphore>,
+}
 
 enum WsData {
     Bytes(Bytes),
@@ -222,23 +240,27 @@ async fn handle_ws(
     });
     info!(response = ?response, "sending response to client");
 
-    let (mut ws_channel_sender, mut ws_channel_receiver) = unbounded_channel();
+    let (sender, mut ws_channel_receiver) = channel::<QueuedWsData>(WS_QUEUE_CAPACITY);
+    let ws_channel_sender = WsQueue {
+        sender,
+        budget: Arc::new(Semaphore::new(WS_MAX_MESSAGE_BYTES)),
+    };
     spawn(
         async move {
-            while let Some(data) = ws_channel_receiver.recv().await {
-                match data {
-                    WsData::Bytes(bytes) => {
-                        if ws_sender.binary(bytes).await.is_err() {
-                            break;
-                        }
+            while let Some(queued) = ws_channel_receiver.recv().await {
+                let _permit = queued._permit;
+                let result = timeout(WS_WRITE_TIMEOUT, async {
+                    match queued.data {
+                        WsData::Bytes(bytes) => ws_sender.binary(bytes).await,
+                        WsData::Text(text) => ws_sender.text(text).await,
                     }
-                    WsData::Text(text) => {
-                        if ws_sender.text(text).await.is_err() {
-                            break;
-                        }
-                    }
+                })
+                .await;
+                if !matches!(result, Ok(Ok(()))) {
+                    break;
                 }
             }
+            let _ = timeout(WS_WRITE_TIMEOUT, ws_sender.close(None)).await;
 
             debug!("stopped web socket sending task");
         }
@@ -246,7 +268,7 @@ async fn handle_ws(
     );
 
     // send response
-    send_ws_message(&mut ws_channel_sender, response);
+    send_ws_message(&ws_channel_sender, response)?;
 
     // main loop
     if let Err(err) = ws_loop(ws_channel_sender, ws_receiver, stream, control_config).await {
@@ -257,7 +279,7 @@ async fn handle_ws(
 }
 
 async fn ws_loop(
-    mut ws_sender: UnboundedSender<WsData>,
+    ws_sender: WsQueue,
     mut ws_receiver: MessageStream,
     mut stream: MoonlightStream,
     control_config: ControlPacketConfig,
@@ -266,153 +288,251 @@ async fn ws_loop(
 
     let mut ws_stopped = false;
 
-    loop {
-        if !stream.is_alive() {
-            break;
-        }
+    let result = async {
+        loop {
+            if !stream.is_alive() {
+                break;
+            }
 
-        select! {
-            // drive the moonlight stream forward
-            result = stream.drive() => {
-                let event = result?;
+            select! {
+                _ = ws_sender.sender.closed() => { return Err(AppError::StreamClosed); }
+                // drive the moonlight stream forward
+                result = stream.drive() => {
+                    let event = result?;
 
-                match event {
-                    MoonlightStreamEvent::Audio(AudioStreamEvent::OnFrame(frame)) => {
-                        let mut buffer = vec![0; 1 + frame.buffer.len()];
-                        buffer[1..].copy_from_slice(&frame.buffer);
+                    match event {
+                        MoonlightStreamEvent::Audio(AudioStreamEvent::OnFrame(frame)) => {
+                            let mut buffer = vec![0; 1 + frame.buffer.len()];
+                            buffer[1..].copy_from_slice(&frame.buffer);
 
-                        buffer[0] = WebSocketChannel::AUDIO;
+                            buffer[0] = WebSocketChannel::AUDIO;
 
-                        let _ = ws_sender.send(WsData::Bytes(buffer.into()));
-                    }
-                    MoonlightStreamEvent::Video(VideoStreamEvent::SignalIdr) => {
-                        if let Err(err)=  stream.send_raw(ControlPacket::RequestIdr) {
-                            warn!(error = %err, "failed to request idr after the moonlight video stream requested an idr");
+                            enqueue_ws_media(&ws_sender, WsData::Bytes(buffer.into()))?;
                         }
+                        MoonlightStreamEvent::Video(VideoStreamEvent::SignalIdr) => {
+                            if let Err(err)=  stream.send_raw(ControlPacket::RequestIdr) {
+                                warn!(error = %err, "failed to request idr after the moonlight video stream requested an idr");
+                            }
+                        }
+                        MoonlightStreamEvent::Video(VideoStreamEvent::OnFrame(frame)) => {
+                            // TODO: avoid using payloading and depayloading the frame like this
+                            let mut buffer = vec![0; 1 + 5 + frame.raw().len()];
+                            buffer[(1 + 5)..].copy_from_slice(frame.raw());
+
+                            buffer[0] = WebSocketChannel::VIDEO;
+                            // TODO: make frame type from video packet public, 2==Idr
+                            buffer[1] = if frame.metadata().frame_type.serialize() == 2 {
+                                1
+                            } else {
+                                0
+                            };
+                            buffer[2..6].copy_from_slice(
+                                &(frame.metadata().timestamp.as_micros() as u32).to_be_bytes(),
+                            );
+
+                            enqueue_ws_media(&ws_sender, WsData::Bytes(buffer.into()))?;
+                        }
+                        MoonlightStreamEvent::Control(ControlStreamEvent::Packet(packet)) => {
+                            let mut buffer = vec![0; ControlPacket::MAX_SIZE + 1];
+
+                            buffer[0] = WebSocketChannel::CONTROL;
+
+                            #[allow(clippy::unwrap_used)]
+                            let packet_len = packet
+                                .serialize(&control_config, buffer[1..].as_mut_array().unwrap())
+                                .unwrap();
+
+                            buffer.truncate(1 + packet_len);
+                            enqueue_ws_media(&ws_sender, WsData::Bytes(buffer.into()))?;
+                        }
+                        _ => {}
                     }
-                    MoonlightStreamEvent::Video(VideoStreamEvent::OnFrame(frame)) => {
-                        // TODO: avoid using payloading and depayloading the frame like this
-                        let mut buffer = vec![0; 1 + 5 + frame.raw().len()];
-                        buffer[(1 + 5)..].copy_from_slice(frame.raw());
-
-                        buffer[0] = WebSocketChannel::VIDEO;
-                        // TODO: make frame type from video packet public, 2==Idr
-                        buffer[1] = if frame.metadata().frame_type.serialize() == 2 {
-                            1
-                        } else {
-                            0
-                        };
-                        buffer[2..6].copy_from_slice(
-                            &(frame.metadata().timestamp.as_micros() as u32).to_be_bytes(),
-                        );
-
-                        let _ = ws_sender.send(WsData::Bytes(buffer.into()));
-                    }
-                    MoonlightStreamEvent::Control(ControlStreamEvent::Packet(packet)) => {
-                        let mut buffer = vec![0; ControlPacket::MAX_SIZE + 1];
-
-                        buffer[0] = WebSocketChannel::CONTROL;
-
-                        #[allow(clippy::unwrap_used)]
-                        let packet_len = packet
-                            .serialize(&control_config, buffer[1..].as_mut_array().unwrap())
-                            .unwrap();
-
-                        buffer.truncate(1 + packet_len);
-                        let _ = ws_sender.send(WsData::Bytes(buffer.into()));
-                    }
-                    _ => {}
                 }
-            }
-            // relay stats
-            _ = relay_stats_ticker.tick() => {
-                let rtt = match stream.estimated_rtt() {
-                    Ok(value) => value,
-                    Err(err) => {
-                        warn!(error = %err, "failed to send rtt to client");
-                        break;
-                    }
-                };
-
-                send_ws_message(
-                    &mut ws_sender,
-                    WebSocketClientboundMessage::Stats(StreamStatsClientboundMessage::RelayRtt {
-                        rtt_ms: rtt.rtt.as_millis() as u32,
-                        rtt_variance_ms: rtt.rtt_variance.as_millis() as u32,
-                    })
-                );
-            }
-            // Handle incoming ws requests
-            result = ws_receiver.recv(), if !ws_stopped => {
-                let Some(Ok(message)) = result else {
-                    ws_stopped = true;
-                    let _ = stream.disconnect();
-                    continue;
-                };
-
-                match message {
-                    Message::Binary(message) => {
-                        if message.is_empty() {
-                            continue;
+                // relay stats
+                _ = relay_stats_ticker.tick() => {
+                    let rtt = match stream.estimated_rtt() {
+                        Ok(value) => value,
+                        Err(err) => {
+                            warn!(error = %err, "failed to send rtt to client");
+                            break;
                         }
+                    };
 
-                        if message[0] == WebSocketChannel::CONTROL {
-                            let Some(packet) = ControlPacket::deserialize(
-                                PacketDirection::ServerBound,
-                                &control_config,
-                                &message[1..],
-                            ) else {
-                                warn!(message = ?message, "received unknown control packet");
+                    send_ws_message(
+                        &ws_sender,
+                        WebSocketClientboundMessage::Stats(StreamStatsClientboundMessage::RelayRtt {
+                            rtt_ms: rtt.rtt.as_millis() as u32,
+                            rtt_variance_ms: rtt.rtt_variance.as_millis() as u32,
+                        })
+                    )?;
+                }
+                // Handle incoming ws requests
+                result = ws_receiver.recv(), if !ws_stopped => {
+                    let Some(Ok(message)) = result else {
+                        ws_stopped = true;
+                        let _ = stream.disconnect();
+                        continue;
+                    };
+
+                    match message {
+                        Message::Binary(message) => {
+                            if message.is_empty() {
                                 continue;
+                            }
+
+                            if message[0] == WebSocketChannel::CONTROL {
+                                let Some(packet) = ControlPacket::deserialize(
+                                    PacketDirection::ServerBound,
+                                    &control_config,
+                                    &message[1..],
+                                ) else {
+                                    warn!(message = ?message, "received unknown control packet");
+                                    continue;
+                                };
+
+                                if let Err(err) = stream.send_raw(packet) {
+                                    warn!(error = %err, "failed to send control packet");
+                                }
+                            }
+                        }
+                        Message::Text(text) => {
+                            let message = match serde_json::from_str::<WebSocketServerboundMessage>(&text) {
+                                Ok(value) => value,
+                                Err(err) => {
+                                    warn!(error = %err, "failed to deserialize serverbound web socket message");
+                                    continue;
+                                }
                             };
 
-                            if let Err(err) = stream.send_raw(packet) {
-                                warn!(error = %err, "failed to send control packet");
+                            if let WebSocketServerboundMessage::Stats(StreamStatsServerboundMessage::Ping(id)) =
+                                message
+                            {
+                                send_ws_message(&ws_sender, WebSocketClientboundMessage::Stats(StreamStatsClientboundMessage::Pong(id)))?;
                             }
                         }
+                        _ => {}
                     }
-                    Message::Text(text) => {
-                        let message = match serde_json::from_str::<WebSocketServerboundMessage>(&text) {
-                            Ok(value) => value,
-                            Err(err) => {
-                                warn!(error = %err, "failed to deserialize serverbound web socket message");
-                                continue;
-                            }
-                        };
-
-                        if let WebSocketServerboundMessage::Stats(StreamStatsServerboundMessage::Ping(id)) =
-                            message
-                        {
-                            send_ws_message(&mut ws_sender, WebSocketClientboundMessage::Stats(StreamStatsClientboundMessage::Pong(id)));
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
-    }
 
+        Ok(())
+    }
+    .await;
+    let _ = stream.disconnect();
+    result
+}
+
+fn enqueue_ws(sender: &WsQueue, data: WsData) -> Result<(), AppError> {
+    let size = match &data {
+        WsData::Bytes(bytes) => bytes.len(),
+        WsData::Text(text) => text.len(),
+    };
+    if size > WS_MAX_MESSAGE_BYTES {
+        return Err(AppError::StreamClosed);
+    }
+    let permit = sender
+        .budget
+        .clone()
+        .try_acquire_many_owned(size as u32)
+        .map_err(|_| AppError::StreamClosed)?;
+    sender
+        .sender
+        .try_send(QueuedWsData {
+            data,
+            _permit: permit,
+        })
+        .map_err(|_| AppError::StreamClosed)
+}
+
+/// Media and host event frames are dropped when the client cannot keep up.
+/// Only a closed channel ends the session, so a momentary stall degrades the
+/// stream instead of disconnecting it. JSON control messages stay strict.
+fn enqueue_ws_media(sender: &WsQueue, data: WsData) -> Result<(), AppError> {
+    if sender.sender.is_closed() {
+        return Err(AppError::StreamClosed);
+    }
+    if enqueue_ws(sender, data).is_err() {
+        trace!("client queue is full, dropping frame");
+    }
     Ok(())
 }
 
-fn send_ws_message(
-    sender: &mut UnboundedSender<WsData>,
-    message: WebSocketClientboundMessage,
-) -> bool {
+fn send_ws_message(sender: &WsQueue, message: WebSocketClientboundMessage) -> Result<(), AppError> {
     trace!(message = ?message, "sending text message to client");
+    let text = serde_json::to_string(&message).map_err(|_| AppError::BadRequest)?;
+    enqueue_ws(sender, WsData::Text(text))
+}
 
-    let text = match serde_json::to_string(&message) {
-        Ok(value) => value,
-        Err(err) => {
-            warn!(error = %err, "failed to send web socket message");
-            return false;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slow_client_queue_rejects_overflow_and_closed_receivers() {
+        let (tx, mut receiver) = channel(WS_QUEUE_CAPACITY);
+        let sender = WsQueue {
+            sender: tx,
+            budget: Arc::new(Semaphore::new(WS_MAX_MESSAGE_BYTES)),
+        };
+        for _ in 0..WS_QUEUE_CAPACITY {
+            enqueue_ws(&sender, WsData::Bytes(Bytes::new())).unwrap();
         }
-    };
-
-    if let Err(err) = sender.send(WsData::Text(text)) {
-        warn!(error = %err, "failed to send web socket message");
-        return false;
+        assert!(enqueue_ws(&sender, WsData::Bytes(Bytes::new())).is_err());
+        assert!(receiver.try_recv().is_ok());
+        assert!(enqueue_ws(&sender, WsData::Bytes(Bytes::new())).is_ok());
+        drop(receiver);
+        assert!(enqueue_ws(&sender, WsData::Bytes(Bytes::new())).is_err());
     }
 
-    true
+    #[test]
+    fn oversized_frames_are_rejected_without_queueing() {
+        let (tx, mut receiver) = channel(WS_QUEUE_CAPACITY);
+        let sender = WsQueue {
+            sender: tx,
+            budget: Arc::new(Semaphore::new(WS_MAX_MESSAGE_BYTES)),
+        };
+        assert!(
+            enqueue_ws(
+                &sender,
+                WsData::Bytes(vec![0; WS_MAX_MESSAGE_BYTES + 1].into())
+            )
+            .is_err()
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn media_frames_are_dropped_instead_of_ending_the_stream() {
+        let (tx, receiver) = channel(WS_QUEUE_CAPACITY);
+        let sender = WsQueue {
+            sender: tx,
+            budget: Arc::new(Semaphore::new(WS_MAX_MESSAGE_BYTES)),
+        };
+        for _ in 0..WS_QUEUE_CAPACITY {
+            enqueue_ws(&sender, WsData::Bytes(Bytes::new())).unwrap();
+        }
+        // A full queue drops the frame but keeps the session alive.
+        assert!(enqueue_ws_media(&sender, WsData::Bytes(Bytes::new())).is_ok());
+        // JSON control messages still fail fast on the same full queue.
+        assert!(enqueue_ws(&sender, WsData::Bytes(Bytes::new())).is_err());
+        // A client that went away does end the session.
+        drop(receiver);
+        assert!(enqueue_ws_media(&sender, WsData::Bytes(Bytes::new())).is_err());
+    }
+
+    #[test]
+    fn queued_bytes_are_bounded_until_the_write_finishes() {
+        let (tx, mut receiver) = channel(WS_QUEUE_CAPACITY);
+        let sender = WsQueue {
+            sender: tx,
+            budget: Arc::new(Semaphore::new(4)),
+        };
+        enqueue_ws(&sender, WsData::Bytes(Bytes::from_static(b"1234"))).unwrap();
+        let in_flight = receiver.try_recv().unwrap();
+        assert!(enqueue_ws(&sender, WsData::Bytes(Bytes::from_static(b"x"))).is_err());
+        drop(in_flight);
+        assert!(enqueue_ws(&sender, WsData::Bytes(Bytes::from_static(b"x"))).is_ok());
+    }
 }

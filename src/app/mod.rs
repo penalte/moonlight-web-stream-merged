@@ -58,6 +58,8 @@ pub enum AppError {
     DefaultUserNotFound,
     #[error("the role was not found")]
     RoleNotFound,
+    #[error("the role is still assigned to users")]
+    RoleInUse,
     #[error("more than one user already exists")]
     FirstUserAlreadyExists,
     #[error("the config option first_login_create_admin is not true")]
@@ -159,6 +161,7 @@ impl ResponseError for AppError {
             Self::RoleNotFound => {
                 HttpResponse::new(StatusCode::NOT_FOUND).set_body(BoxBody::new("role not found"))
             }
+            Self::RoleInUse => HttpResponse::new(StatusCode::CONFLICT),
             Self::StreamClosed => {
                 HttpResponse::new(StatusCode::NOT_FOUND).set_body(BoxBody::new("stream not found"))
             }
@@ -256,6 +259,10 @@ impl App {
         &self.inner.config
     }
 
+    pub async fn flush_storage(&self) -> Result<(), AppError> {
+        self.inner.storage.flush().await
+    }
+
     // -- Streams
 
     async fn insert_stream(&self, f: impl FnOnce(StreamId) -> Stream) -> Result<Stream, AppError> {
@@ -306,8 +313,13 @@ impl App {
 
         let admin_role = self.admin_role().await?;
 
-        let mut user = self
-            .add_user_no_auth(StorageUserAdd {
+        if username.is_empty() {
+            return Err(AppError::UserNameEmpty);
+        }
+        let stored = self
+            .inner
+            .storage
+            .add_first_user(StorageUserAdd {
                 name: username.clone(),
                 password: Some(StoragePassword::new(&password)?),
                 role_id: admin_role.id(),
@@ -315,6 +327,13 @@ impl App {
                 oidc_identity: None,
             })
             .await?;
+        let mut user = AuthenticatedUser {
+            inner: User {
+                app: self.new_ref(),
+                id: stored.id,
+                cache_storage: Some(Arc::new(stored)),
+            },
+        };
 
         if self.config().web_server.first_login_assign_global_hosts {
             // Note: only this user exists and all hosts are global, if migrated from v1 to v2

@@ -184,6 +184,11 @@ fn init_log(config: &Config) -> Option<non_blocking::WorkerGuard> {
         .with_ansi(io::stdout().is_terminal());
 
     let (file_layer, guard) = if let Some(log_file) = &config.log.file_path {
+        if let Some(parent) = std::path::Path::new(log_file).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).expect("failed to create log directory");
+        }
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -364,6 +369,7 @@ async fn start(
         None => server.await?,
     }
 
+    app.flush_storage().await?;
     Ok(())
 }
 
@@ -391,6 +397,11 @@ fn windows_service_main(_arguments: Vec<std::ffi::OsString>) {
     let (shutdown_sender, shutdown_receiver) = oneshot::channel();
     let shutdown_sender = Arc::new(Mutex::new(Some(shutdown_sender)));
     let control_sender = shutdown_sender.clone();
+    // The handler needs the status handle that register() returns below, so the
+    // slot is filled in immediately after registration.
+    let status_slot: Arc<Mutex<Option<service_control_handler::ServiceStatusHandle>>> =
+        Arc::new(Mutex::new(None));
+    let handler_status = status_slot.clone();
     let event_handler = move |control_event| match control_event {
         ServiceControl::Stop | ServiceControl::Shutdown => {
             if let Ok(mut sender) = control_sender.lock() {
@@ -398,9 +409,23 @@ fn windows_service_main(_arguments: Vec<std::ffi::OsString>) {
                     let _ = sender.send(());
                 }
             }
-            // Windows SCM must release the executable before an installer can replace it.
-            // Actix may retain stream workers indefinitely, so do not wait for them here.
-            std::process::exit(0);
+            // Stopping now drains HTTP workers and flushes storage, so report
+            // StopPending with a wait hint rather than letting the SCM decide we
+            // stopped responding. The installer polls for the same 30 seconds.
+            if let Ok(status) = handler_status.lock()
+                && let Some(handle) = status.as_ref()
+            {
+                let _ = handle.set_service_status(ServiceStatus {
+                    service_type: ServiceType::OWN_PROCESS,
+                    current_state: ServiceState::StopPending,
+                    controls_accepted: ServiceControlAccept::empty(),
+                    exit_code: ServiceExitCode::Win32(0),
+                    checkpoint: 0,
+                    wait_hint: Duration::from_secs(30),
+                    process_id: None,
+                });
+            }
+            ServiceControlHandlerResult::NoError
         }
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
         _ => ServiceControlHandlerResult::NotImplemented,
@@ -413,6 +438,9 @@ fn windows_service_main(_arguments: Vec<std::ffi::OsString>) {
             return;
         }
     };
+    if let Ok(mut status) = status_slot.lock() {
+        *status = Some(status_handle);
+    }
 
     let running_status = ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,

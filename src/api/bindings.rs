@@ -395,7 +395,7 @@ pub struct PatchRoleRequest {
     /// The role id
     pub id: u32,
     pub name: Option<String>,
-    pub ty: RoleType,
+    pub ty: Option<RoleType>,
     pub default_settings: Option<TsAny>,
     pub permissions: Option<StreamPermissions>,
 }
